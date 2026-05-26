@@ -1194,34 +1194,54 @@ func getActivityEnvironmentFromCtx(ctx context.Context) *activityEnvironment {
 }
 
 // AggregatedWorker combines management of both workflowWorker and activityWorker worker lifecycle.
+// AggregatedWorker 是 Temporal Go SDK 中 Worker 的核心聚合结构体。
+// 它统一管理了 Workflow Worker、Activity Worker、Session Worker、Nexus Worker 这四种
+// 子 Worker 的生命周期（创建、启动、停止），以及插件系统、心跳上报、错误处理等横切关注点。
+//
+// 设计意图：使用者通过 NewAggregatedWorker 创建一个 AggregatedWorker，然后只需要调用
+// Start() / Stop() 即可控制所有子 Worker 的启停，无需分别操作。
 type AggregatedWorker struct {
-	// Stored for creating a nexus worker on Start.
+	// executionParams 保存了所有执行参数（namespace、taskqueue、logger、版本信息等），
+	// 在 NewAggregatedWorker 中填充完成，传递给各个子 Worker 使用。
+	// 注意：Nexus Worker 在 Start() 时才会被创建，所以需要保留此字段供那时使用。
 	executionParams workerExecutionParameters
-	// Memoized start function. Ensures start runs once and returns the same error when called multiple times.
+
+	// memoizedStart 是 Start() 的包装函数，内部使用 sync.OnceValue 确保：
+	// 1. 无论 Start() 被调用多少次，start() 只会真正执行一次
+	// 2. 多次调用返回相同的结果（包括 error）
+	// 这样可以安全地在多个 goroutine 中并发调用 Start()。
 	memoizedStart func() error
 
-	client         *WorkflowClient
-	workflowWorker *workflowWorker
-	activityWorker *activityWorker
-	sessionWorker  *sessionWorker
-	nexusWorker    *nexusWorker
-	logger         log.Logger
-	registry       *registry
-	// Stores a boolean indicating whether the worker has already been started.
+	client         *WorkflowClient // SDK 客户端，封装了与 Temporal Server 的 gRPC 连接
+	workflowWorker *workflowWorker // Workflow Task 处理 Worker（可选，DisableWorkflowWorker=true 时为 nil）
+	activityWorker *activityWorker // Activity Task 处理 Worker（可选，LocalActivityWorkerOnly=true 时为 nil）
+	sessionWorker  *sessionWorker  // Session 内部 Worker（仅在 EnableSessionWorker=true 时创建）
+	nexusWorker    *nexusWorker    // Nexus 协议 Worker（仅在有已注册 Nexus Service 时，在 Start() 中延迟创建）
+	logger         log.Logger      // 带 namespace + taskqueue + workerID 标签的结构化日志
+	registry       *registry       // Worker 级别的注册表：存储 Workflow/Activity/NexusService 的映射
+
+	// started 在 start() 执行开始时即设置为 true，代表 Worker 已经启动（或正在启动中）
 	started      atomic.Bool
+	// shuttingDown 在 Stop() 被调用时设置为 true，用于通知心跳回调等组件当前正在关闭
 	shuttingDown atomic.Bool
+	// stopC 是一个关闭后永不重置的 channel（close-once），所有子 Worker 的 goroutine
+	// 通过 <-stopC 来感知"Worker 需要停止"的信号，实现统一的优雅关闭
 	stopC        chan struct{}
-	fatalErr     error
-	fatalErrLock sync.Mutex
+	fatalErr     error        // 致命错误（来自 WorkerFatalErrorCallback 回调）
+	fatalErrLock sync.Mutex   // 保护 fatalErr 的读写互斥锁
+
+	// capabilities 保存了 Temporal Server 的能力信息（如是否支持某些 protobuf 特性）。
+	// 这是一个指针，因为 Worker 在创建时还没有连接 Server，只有在 Start() 中
+	// 通过 loadCapabilities() 从 Server 获取后才填充，各子 Worker 通过解引用读取。
 	capabilities *workflowservice.GetSystemInfoResponse_Capabilities
 
-	workerInstanceKey     string
-	plugins               []WorkerPlugin
-	pluginRegistryOptions *WorkerPluginConfigureWorkerRegistryOptions // Never nil
+	workerInstanceKey     string                                    // Worker 实例的唯一标识符（UUID），用于心跳识别
+	plugins               []WorkerPlugin                            // Worker 插件列表（含 Client 级别 + WorkerOptions 级别）
+	pluginRegistryOptions *WorkerPluginConfigureWorkerRegistryOptions // 插件在 ConfigureWorker 阶段填充的注册选项（Never nil）
 
-	heartbeatMetrics             *heartbeatMetricsHandler
-	heartbeatCallback            func() *workerpb.WorkerHeartbeat
-	workerPollCompleteOnShutdown *atomic.Bool
+	heartbeatMetrics             *heartbeatMetricsHandler           // 心跳指标采集器（仅当 workerHeartbeatInterval != 0 时创建）
+	heartbeatCallback            func() *workerpb.WorkerHeartbeat   // 构造心跳 PB 消息的回调函数（在心跳 goroutine 中并发调用）
+	workerPollCompleteOnShutdown *atomic.Bool                       // Server 是否支持"Shutdown 时完成当前 Poll"的标志
 }
 
 // RegisterWorkflow registers workflow implementation with the AggregatedWorker
@@ -1315,27 +1335,45 @@ func (aw *AggregatedWorker) Start() error {
 	return aw.memoizedStart()
 }
 
-// start the worker. This method is memoized using sync.OnceValue in memoizedStart.
+// start 是 Worker 真正的启动逻辑，被 memoizedStart 包裹以确保只执行一次。
+//
+// 启动流程（按顺序）：
+//   1. 初始化二进制校验和 + 确保 Client 连接到 Server
+//   2. 从 Server 拉取 Capabilities 和 Namespace 数据（payload 限制等）
+//   3. 按顺序启动各子 Worker：workflowWorker → activityWorker → sessionWorker → nexusWorker
+//      - 如果某个子 Worker 启动失败，会回滚已启动的子 Worker（保证优雅清理）
+//   4. 注册心跳 Worker（如果启用了心跳）
+//
+// 注意：此方法通过 sync.OnceValue 被 memoized，所以是幂等的。
 func (aw *AggregatedWorker) start() error {
 	aw.started.Store(true)
 
+	// --- 步骤 1：初始化校验和 + 确保 Client 连接就绪 ---
+	// initBinaryChecksum 计算当前可执行文件的校验和，用于日志/调试时识别 Worker 版本
 	if err := initBinaryChecksum(); err != nil {
 		return fmt.Errorf("failed to get executable checksum: %v", err)
 	} else if err = aw.client.ensureInitialized(context.Background()); err != nil {
-		return err
+		return err // ensureInitialized 确保 gRPC 连接、namespace 校验等已完成
 	}
-	// Populate the capabilities. This should be the only time it is written too.
+
+	// --- 步骤 2a：从 Server 拉取 Capabilities ---
+	// 这是 &capabilities 指针唯一一次被写入的地方。各子 Worker 持有同一指针，
+	// 它们会在运行时通过解引用来读取 Server 支持的特性。
 	capabilities, err := aw.client.loadCapabilities(context.Background())
 	if err != nil {
 		return err
 	}
 	proto.Merge(aw.capabilities, capabilities)
 
+	// --- 步骤 2b：从 Server 拉取 Namespace 数据（payload 大小限制等）---
 	nsData, err := aw.client.loadNamespaceData(aw.executionParams.MetricsHandler)
 	if err != nil {
 		return err
 	}
 
+	// --- 步骤 2c：应用 Payload 错误限制 ---
+	// setErrorLimits 是在 NewAggregatedWorker 阶段通过闭包注入的回调，
+	// 它使用 Server 返回的 namespace 级别限制来配置 payload 大小检查逻辑。
 	if aw.executionParams.setErrorLimits != nil {
 		payloadSizeError := int64(0)
 		if nsData.limits.BlobSizeLimitError > 0 {
@@ -1351,14 +1389,19 @@ func (aw *AggregatedWorker) start() error {
 		})
 	}
 
+	// --- 步骤 2d：根据 Server Capabilities 设置运行时标志 ---
+	// WorkerPollCompleteOnShutdown：Server 是否支持在关闭时等待当前 Poll 完成
 	if nsData.capabilities.GetWorkerPollCompleteOnShutdown() {
 		aw.workerPollCompleteOnShutdown.Store(true)
 	}
 
+	// PollerAutoscaling：Server 是否支持 Poller 自动扩缩容
 	if nsData.capabilities.GetPollerAutoscaling() {
 		aw.executionParams.serverSupportsAutoscaling.Store(true)
 	}
 
+	// --- 步骤 3a：启动 Workflow Worker ---
+	// 同时将其注册到 Eager Dispatcher（如果 Client 支持 Eager Activity 分发）
 	if !util.IsInterfaceNil(aw.workflowWorker) {
 		if err := aw.workflowWorker.Start(); err != nil {
 			return err
@@ -1367,9 +1410,11 @@ func (aw *AggregatedWorker) start() error {
 			aw.client.eagerDispatcher.registerWorker(aw.workflowWorker)
 		}
 	}
+	// --- 步骤 3b：启动 Activity Worker ---
+	// 失败时会回滚：停止 workflowWorker 并 deregister Eager Dispatcher
 	if !util.IsInterfaceNil(aw.activityWorker) {
 		if err := aw.activityWorker.Start(); err != nil {
-			// stop workflow worker.
+			// 回滚：停止 workflowWorker
 			if !util.IsInterfaceNil(aw.workflowWorker) {
 				if aw.workflowWorker.worker.isWorkerStarted {
 					if aw.client.eagerDispatcher != nil {
@@ -1382,10 +1427,13 @@ func (aw *AggregatedWorker) start() error {
 		}
 	}
 
+	// --- 步骤 3c：启动 Session Worker ---
+	// 条件：Session 功能已启用 且 有已注册的 Activity。
+	// 失败时回滚 workflowWorker + activityWorker。
 	if !util.IsInterfaceNil(aw.sessionWorker) && len(aw.registry.getRegisteredActivities()) > 0 {
 		aw.logger.Info("Starting session worker")
 		if err := aw.sessionWorker.Start(); err != nil {
-			// stop workflow worker and activity worker.
+			// 回滚：停止 workflowWorker 和 activityWorker
 			if !util.IsInterfaceNil(aw.workflowWorker) {
 				if aw.workflowWorker.worker.isWorkerStarted {
 					aw.workflowWorker.Stop()
@@ -1399,6 +1447,10 @@ func (aw *AggregatedWorker) start() error {
 			return err
 		}
 	}
+	// --- 步骤 3d：按需创建并启动 Nexus Worker ---
+	// Nexus Worker 是唯一在 start() 中延迟创建的子 Worker。
+	// 原因：Nexus Worker 的创建依赖于用户是否注册了 Nexus Service，
+	// 而注册动作通常发生在 NewAggregatedWorker 和 Start() 之间。
 	nexusServices := aw.registry.getRegisteredNexusServices()
 	if len(nexusServices) > 0 {
 		reg := nexus.NewServiceRegistry()
@@ -1427,6 +1479,9 @@ func (aw *AggregatedWorker) start() error {
 		}
 	}
 
+	// --- 步骤 4：注册心跳 Worker ---
+	// 启动一个独立的 goroutine，按 workerHeartbeatInterval 定时调用 heartbeatCallback
+	// 构造心跳消息并上报给 Server。
 	if aw.client.workerHeartbeatInterval > 0 {
 		if err := aw.registerHeartbeatWorker(); err != nil {
 			return fmt.Errorf("failed to register heartbeat worker: %w", err)
@@ -2165,17 +2220,44 @@ func extractHistoryFromFile(jsonfileName string, lastEventID int64) (hist *histo
 }
 
 // NewAggregatedWorker returns an instance to manage both activity and workflow workers
+// NewAggregatedWorker 创建一个聚合 Worker 实例，它是 Temporal Go SDK 中 Worker 的核心入口。
+//
+// 生命周期概览：
+//   1. NewAggregatedWorker(): 构造 + 校验参数 + 创建各子 Worker + 设置心跳回调 + 包装 memoizedStart
+//   2. RegisterWorkflow/RegisterActivity/...: 注册 Workflow/Activity/Nexus Service
+//   3. Start() -> memoizedStart() -> start(): 连接 Server、获取 capabilities、启动各子 Worker、启动心跳
+//   4. Stop(): 逐个关闭子 Worker、deregister 心跳、等待完成
+//
+// 参数：
+//   - client: SDK 客户端，包含 gRPC 连接、DataConverter、interceptors 等基础能力
+//   - taskQueue: Worker 监听的任务队列名称（不能是 Temporal 内部队列）
+//   - options: Worker 的行为配置（并发数、版本控制、Session、插件等）
+//
+// 返回值总不为 nil；参数校验错误会直接 panic（属于编程错误，应尽早暴露）。
 func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options WorkerOptions) *AggregatedWorker {
+	// =========================================================================
+	// 阶段 1：基础参数校验
+	// =========================================================================
+
+	// Temporal 内部保留的 TaskQueue 前缀（如 "/_sys/"），SDK Worker 不允许使用
 	if strings.HasPrefix(taskQueue, temporalPrefix) {
 		panic(temporalPrefixError)
 	}
 
-	// Combine client-provided worker plugins with current options set and apply to options
+	// =========================================================================
+	// 阶段 2：插件（Plugin）初始化
+	// =========================================================================
+	// 合并 Client 级别和 Worker 级别的插件，然后依次调用 ConfigureWorker 生命周期钩子。
+	// 插件列表顺序：先 Client 插件，后 Worker 插件。
+	// 注意：这里使用了三参数 append 技巧 (append([]T(nil), src...)) 来创建一个新的 slice，
+	// 避免对 client.workerPlugins 的后续修改影响到本 Worker。
 	workerInstanceKey := uuid.NewString()
 	var pluginRegistryOptions WorkerPluginConfigureWorkerRegistryOptions
 	plugins := append(append([]WorkerPlugin(nil), client.workerPlugins...), options.Plugins...)
 	for _, plugin := range plugins {
-		// No meaningful context to pass at this time, and all errors are panics when configuring worker
+		// ConfigureWorker 允许插件修改 WorkerOptions 和 WorkerRegistryOptions，
+		// 所以需要在 apply defaults 之前执行。此时没有有意义的 context，且所有 error 都是
+		// 代码级别的配置错误，直接 panic 是合适的。
 		if err := plugin.ConfigureWorker(context.Background(), WorkerPluginConfigureWorkerOptions{
 			WorkerInstanceKey:     workerInstanceKey,
 			TaskQueue:             taskQueue,
@@ -2186,38 +2268,47 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 		}
 	}
 
+	// =========================================================================
+	// 阶段 3：填充默认值 + 参数二次校验
+	// =========================================================================
 	setClientDefaults(client)
 	setWorkerOptionsDefaults(&options)
 	ctx := options.BackgroundActivityContext
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// backgroundActivityContext 是所有 Activity 执行的根 Context。
+	// 当 Worker 停止时，通过 backgroundActivityContextCancel 取消该 Context，
+	// 从而实现对所有正在执行的 Activity 的级联取消。
 	backgroundActivityContext, backgroundActivityContextCancel := context.WithCancelCause(ctx)
 
-	// If max-concurrent workflow pollers is 1, the worker will only do
-	// sticky-queue requests and never regular-queue requests. We disallow the
-	// value of 1 here.
+	// 为什么 MaxConcurrentWorkflowTaskPollers 不允许为 1？
+	// Sticky Queue（黏性队列）会占用 1 个 poller。如果总 poller 数只有 1，
+	// 那这个 poller 永远挂在 sticky queue 上，普通 queue 永远得不到服务，
+	// 导致此 Worker 无法接收新的 Workflow Task（首次匹配或 sticky 失效后的 fallback）。
 	if options.MaxConcurrentWorkflowTaskPollers == 1 {
 		panic("cannot set MaxConcurrentWorkflowTaskPollers to 1")
 	}
 
-	// If max-concurrent workflow task execution size is 1, the worker will only do
-	// sticky-queue requests and never regular-queue requests. This is because we
-	// limit the number of running pollers to MaxConcurrentWorkflowTaskExecutionSize.
-	// 	We disallow the value of 1 here.
+	// 为什么 MaxConcurrentWorkflowTaskExecutionSize 不允许为 1？
+	// 运行中的 poller 数量受 MaxConcurrentWorkflowTaskExecutionSize 限制。
+	// 如果该值为 1，那仅有的一个 poller 也是永远挂在 sticky queue 上，
+	// 同样无法接收普通队列的任务。
 	if options.MaxConcurrentWorkflowTaskExecutionSize == 1 {
 		panic("cannot set MaxConcurrentWorkflowTaskExecutionSize to 1")
 	}
 
-	// Sessions are not currently compatible with worker versioning
-	// See: https://github.com/temporalio/sdk-go/issues/1227
+	// Session Worker 与 Worker Versioning 互不兼容
+	// 参见：https://github.com/temporalio/sdk-go/issues/1227
 	if options.EnableSessionWorker && options.UseBuildIDForVersioning {
 		panic("cannot set both EnableSessionWorker and UseBuildIDForVersioning")
 	}
 
+	// 如果 DeploymentOptions 中指定了 Version，将其 BuildID 同步到此 Worker 的 BuildID
 	if (options.DeploymentOptions.Version != WorkerDeploymentVersion{}) {
 		options.BuildID = options.DeploymentOptions.Version.BuildID
 	}
+	// 语义冲突校验：如果未启用版本控制，却设置了默认的版本行为，这没有意义
 	if !options.DeploymentOptions.UseVersioning &&
 		options.DeploymentOptions.DefaultVersioningBehavior != VersioningBehaviorUnspecified {
 		panic("cannot set both DeploymentOptions.DefaultVersioningBehavior if DeploymentOptions.UseBuildIDForVersioning is false")
@@ -2227,51 +2318,68 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 		panic("MaxConcurrentWorkflowTaskExternalStorageVisits must not be negative")
 	}
 
-	// Need reference to result for fatal error handler
+	// =========================================================================
+	// 阶段 4：构造致命错误回调（fatalErrorCallback）
+	// =========================================================================
+	// 致命错误回调的设计要点：
+	//   1. 这是一个闭包，引用了尚未创建完成的 aw（AggregatedWorker），所以需要先用 var aw *AggregatedWorker 占位。
+	//   2. 使用互斥锁保护 fatalErr，确保只有第一个致命错误被记录（幂等性）。
+	//   3. 记录错误后依次：调用用户注册的 OnFatalError 回调 → 触发 Stop() 停止整个 Worker。
+	//   4. select 判断 stopC 是否已关闭：如果已关闭说明 Worker 已经在停止中，无需重复 Stop()。
 	var aw *AggregatedWorker
 	fatalErrorCallback := func(err error) {
-		// Set the fatal error if not already set
 		aw.fatalErrLock.Lock()
 		alreadySet := aw.fatalErr != nil
 		if !alreadySet {
-			aw.fatalErr = err
+			aw.fatalErr = err // 只有第一个致命错误被记录
 		}
 		aw.fatalErrLock.Unlock()
-		// Only do the rest if not already set
 		if !alreadySet {
-			// Invoke the callback if present
 			if options.OnFatalError != nil {
-				options.OnFatalError(err)
+				options.OnFatalError(err) // 通知用户注册的错误处理回调
 			}
-			// Stop the worker if not already stopped
 			select {
 			case <-aw.stopC:
+				// stopC 已关闭 → Worker 已经在停止流程中，不需要再次调用 Stop()
 			default:
-				aw.Stop()
+				aw.Stop() // 触发 Worker 的优雅关闭
 			}
 		}
 	}
-	// Because of lazy clients we need to wait till the worker runs to fetch the capabilities.
-	// All worker systems that depend on the capabilities to process workflow/activity tasks
-	// should take a pointer to this struct and wait for it to be populated when the worker is run.
+	// capabilities 是一个"延迟填充"的值。
+	// 在 NewAggregatedWorker 阶段，还没有与 Server 建立连接，无法获取 Server 的能力信息。
+	// 这里只声明一个零值结构体，把 &capabilities 指针放入 workerExecutionParameters，
+	// 各子 Worker 通过解引用这个指针来访问 capabilities。
+	// 真正的填充发生在 start() -> loadCapabilities() 中（此时已连上 Server）。
 	var capabilities workflowservice.GetSystemInfoResponse_Capabilities
 
+	// =========================================================================
+	// 阶段 5：Metrics（指标）、Identity、Logger 初始化
+	// =========================================================================
+	// 基础 Metrics Handler 会附加上 TaskQueue 标签，确保同一个进程内不同 TaskQueue
+	// 的 Worker 指标可以区分。
 	baseMetricsHandler := client.metricsHandler.WithTags(metrics.TaskQueueTags(taskQueue))
 	var metricsHandler metrics.Handler
 	var heartbeatMetrics *heartbeatMetricsHandler
 
 	if client.workerHeartbeatInterval != 0 {
+		// 如果启用了 Worker 心跳（workerHeartbeatInterval > 0），
+		// 使用 heartbeatMetricsHandler 包装基础 Metrics Handler。
+		// 这个包装器会在心跳构造时填充累计的执行计数和失败计数等指标。
 		heartbeatMetrics = newHeartbeatMetricsHandler(baseMetricsHandler)
 		metricsHandler = heartbeatMetrics
 	} else {
 		metricsHandler = baseMetricsHandler
 	}
 
+	// Worker 的身份标识：优先使用 options.Identity，否则使用 client 默认的 identity（通常是进程 PID）
 	identity := client.identity
 	if options.Identity != "" {
 		identity = options.Identity
 	}
 
+	// 构造结构化 Logger，附加 namespace、taskQueue、workerID 三个标签，
+	// 使得日志可以按这些维度检索和过滤。
 	logger := client.logger
 	if logger == nil {
 		logger = ilog.NewDefaultLogger()
@@ -2282,16 +2390,26 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 		tagWorkerID, identity,
 	)
 	if options.BuildID != "" {
-		// Add worker build ID to the logs if it's set by user
+		// 如果用户指定了 Build ID（Worker 版本标识），也附加到日志中
 		logger = log.With(logger,
 			tagBuildID, options.BuildID,
 		)
 	}
 
+	// =========================================================================
+	// 阶段 6：Payload Visitor + Worker Cache + 组装 workerExecutionParameters
+	// =========================================================================
+
+	// payloadLimitVisitor 用于检查 Payload 是否超过 Server 限制，超限时打 WARN 日志
 	payloadLimitVisitor, setErrorLimits := newPayloadLimitsVisitor(client.payloadWarningLimits, logger)
 
+	// cache 是 Worker 级别的 LRU 缓存，用于 Workflow 的 History 重放等场景
 	cache := NewWorkerCache()
+	// workerPollCompleteOnShutdown：是否在 Shutdown 时等待当前 Poll 完成再退出
 	workerPollCompleteOnShutdown := &atomic.Bool{}
+
+	// workerExecutionParameters 是所有执行参数的聚合体，被各子 Worker 共享。
+	// 它包含了从 client、options 和函数内部推导出来的所有运行时参数。
 	workerParams := workerExecutionParameters{
 		Namespace:                        client.namespace,
 		TaskQueue:                        taskQueue,
@@ -2319,22 +2437,26 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 		DefaultHeartbeatThrottleInterval: options.DefaultHeartbeatThrottleInterval,
 		MaxHeartbeatThrottleInterval:     options.MaxHeartbeatThrottleInterval,
 		cache:                            cache,
+		// eagerActivityExecutor 用于支持 Eager Activity（Activity 不经过 TaskQueue 直接分发给同一 Worker）
 		eagerActivityExecutor: newEagerActivityExecutor(eagerActivityExecutorOptions{
 			disabled:      options.DisableEagerActivities,
 			taskQueue:     taskQueue,
 			maxConcurrent: options.MaxConcurrentEagerActivityExecutionSize,
 		}),
-		capabilities:                 &capabilities,
-		pollTimeTracker:              &pollTimeTracker{},
+		capabilities:                 &capabilities,           // 延迟填充：start() 中从 Server 拉取
+		pollTimeTracker:              &pollTimeTracker{},      // 追踪各 Poll 的耗时和空闲时间
 		workerInstanceKey:            workerInstanceKey,
 		workerPollCompleteOnShutdown: workerPollCompleteOnShutdown,
-		serverSupportsAutoscaling:    &atomic.Bool{},
-		inboundPayloadVisitor:        extstore.NewExternalRetrievalVisitor(client.storageParams),
+		serverSupportsAutoscaling:    &atomic.Bool{},          // 延迟填充：start() 中根据 Server 能力设置
+		// inboundPayloadVisitor：处理进入 Worker 的 Payload（如外部存储引用解析）
+		inboundPayloadVisitor: extstore.NewExternalRetrievalVisitor(client.storageParams),
+		// outboundPayloadVisitor：处理离开 Worker 的 Payload（如外部存储上传 + Payload 大小限制检查）
 		outboundPayloadVisitor: newCompositePayloadVisitor(
 			extstore.NewExternalStorageVisitor(client.storageParams),
 			payloadLimitVisitor,
 		),
 		payloadVisitorConcurrency: options.MaxConcurrentWorkflowTaskExternalStorageVisits,
+		// setErrorLimits 闭包：在 start() 中从 Server 拉取到 namespace 级别限制后调用
 		setErrorLimits: func(limits *payloadLimits) {
 			if !options.DisablePayloadErrorLimit {
 				setErrorLimits(limits)
@@ -2342,6 +2464,15 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 		},
 	}
 
+	// =========================================================================
+	// 阶段 7：Poller 行为策略设置
+	// =========================================================================
+	// 每种任务类型（Workflow/Activity/Nexus）都支持两种 Poller 策略配置方式：
+	//   a) 简单模式：设置 MaxConcurrentXxxTaskPollers（用内置的 PollerBehaviorSimpleMaximum）
+	//   b) 高级模式：传入自定义 PollerBehavior（支持自动扩缩容等复杂策略）
+	// 二者必须至少设置一个，否则 panic。同时设置了的话，简单模式优先。
+
+	// Workflow Task Poller
 	if options.MaxConcurrentWorkflowTaskPollers != 0 {
 		workerParams.WorkflowTaskPollerBehavior = NewPollerBehaviorSimpleMaximum(PollerBehaviorSimpleMaximumOptions{
 			MaximumNumberOfPollers: options.MaxConcurrentWorkflowTaskPollers,
@@ -2352,6 +2483,7 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 		panic("must set either MaxConcurrentWorkflowTaskPollers or WorkflowTaskPollerBehavior")
 	}
 
+	// Activity Task Poller
 	if options.MaxConcurrentActivityTaskPollers != 0 {
 		workerParams.ActivityTaskPollerBehavior = NewPollerBehaviorSimpleMaximum(PollerBehaviorSimpleMaximumOptions{
 			MaximumNumberOfPollers: options.MaxConcurrentActivityTaskPollers,
@@ -2362,6 +2494,7 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 		panic("must set either MaxConcurrentActivityTaskPollers or ActivityTaskPollerBehavior")
 	}
 
+	// Nexus Task Poller
 	if options.MaxConcurrentNexusTaskPollers != 0 {
 		workerParams.NexusTaskPollerBehavior = NewPollerBehaviorSimpleMaximum(PollerBehaviorSimpleMaximumOptions{
 			MaximumNumberOfPollers: options.MaxConcurrentNexusTaskPollers,
@@ -2372,38 +2505,65 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 		panic("must set either MaxConcurrentNexusTaskPollers or NexusTaskPollerBehavior")
 	}
 
+	// 最终校验 workerParams 中的必需参数是否都已正确设置
 	ensureRequiredParams(&workerParams)
 
+	// 处理测试标签（用于测试场景下注入额外参数，生产环境中通常为空）
 	processTestTags(&options, &workerParams)
 
-	// worker specific registry
+	// =========================================================================
+	// 阶段 8：创建注册表（Registry）+ 组装拦截器链（Interceptor Chain）
+	// =========================================================================
+	// registry 是 Worker 级别的注册表，存储所有 Workflow/Activity/NexusService 的
+	// 函数名→函数实现的映射关系。
 	registry := newRegistryWithOptions(registryOptions{disableAliasing: options.DisableRegistrationAliasing})
-	// Build set of interceptors using the applicable client ones first (being
-	// careful not to append to the existing slice)
+	// 拦截器链的拼接顺序：Client 级别的拦截器在前，Worker 级别的拦截器在后。
+	// 这样 Client 级别的拦截器（如 Tracing）可以包裹住 Worker 级别的拦截器。
+	// 注意：用 make + append 而非直接 append，是为了避免修改 client.workerInterceptors 底层数组。
 	registry.interceptors = make([]WorkerInterceptor, 0, len(client.workerInterceptors)+len(options.Interceptors))
 	registry.interceptors = append(append(registry.interceptors, client.workerInterceptors...), options.Interceptors...)
 
-	// workflow factory.
+	// =========================================================================
+	// 阶段 9：创建子 Worker
+	// =========================================================================
+	// AggregatedWorker 下辖 4 种 Worker（按创建顺序）：
+	//   workflowWorker  — 处理 Workflow Task（流程编排逻辑）
+	//   activityWorker  — 处理 Activity Task（业务逻辑执行单元）
+	//   sessionWorker   — 处理 Session（需要保证 Activity 在同一 Host 上连续执行）
+	//   nexusWorker     — 延迟创建（在 Start() 中有注册 Nexus Service 时才创建）
+
+	// --- 9a. Workflow Worker ---
+	// 除非显式设置 DisableWorkflowWorker=true（纯 Activity Worker 模式），否则总是创建。
 	var workflowWorker *workflowWorker
 	if !options.DisableWorkflowWorker {
 		testTags := getTestTags(options.BackgroundActivityContext)
 		if len(testTags) > 0 {
+			// 测试模式：允许注入 Pressure Points（用于模拟各种异常场景的测试钩子）
 			workflowWorker = newWorkflowWorkerWithPressurePoints(client, workerParams, testTags, registry)
 		} else {
+			// 生产模式
 			workflowWorker = newWorkflowWorker(client, workerParams, nil, registry)
 		}
 	}
 
-	// activity types.
+	// --- 9b. Activity Worker ---
+	// LocalActivityWorkerOnly 模式：只执行 Local Activity（不需要远程 Poll），不创建完整 Activity Worker。
+	// 注意：eagerActivityExecutor 需要持有 activityWorker 引用，用于实现 Eager Activity 分发。
 	var activityWorker *activityWorker
 	if !options.LocalActivityWorkerOnly {
 		activityWorker = newActivityWorker(client, workerParams, nil, registry, nil)
 		workerParams.eagerActivityExecutor.activityWorker = activityWorker.worker
 	}
 
+	// --- 9c. Session Worker ---
+	// Session Worker 保证一组 Activity 始终被同一个 Worker 实例执行，通常用于需要
+	// 本地状态连续性的场景（如文件处理）。注意 Session Worker 和 LocalActivityWorkerOnly 不兼容。
 	var sessionWorker *sessionWorker
 	if options.EnableSessionWorker && !options.LocalActivityWorkerOnly {
 		sessionWorker = newSessionWorker(client, workerParams, registry, options.MaxConcurrentSessionExecutionSize)
+		// 自动注册 Session 内部使用的两个系统 Activity：
+		//   sessionCreationActivity   — 在 Server 端创建 Session
+		//   sessionCompletionActivity — 在 Server 端完成/释放 Session
 		registry.RegisterActivityWithOptions(sessionCreationActivity, RegisterActivityOptions{
 			Name: sessionCreationActivityName,
 		})
@@ -2412,10 +2572,15 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 		})
 	}
 
-	// Resolve the SysInfoProvider used for worker heartbeats. Prefer the explicit
-	// WorkerOptions.SysInfoProvider; otherwise fall back to the tuner's slot supplier if it
-	// implements HasSysInfoProvider. If both are set to different providers, that's a config
-	// error. If neither is set, heartbeats report 0 for CPU/memory usage.
+	// =========================================================================
+	// 阶段 10：解析系统信息提供者（SysInfoProvider）
+	// =========================================================================
+	// SysInfoProvider 用于 Worker 心跳时报告宿主机的 CPU 和内存使用率。
+	// 两个来源：
+	//   a) WorkerOptions.SysInfoProvider：用户显式设置
+	//   b) Tuner 的 SlotSupplier 可能实现了 HasSysInfoProvider 接口（自动提供的系统信息）
+	// 冲突处理：如果两者都设置了但不是同一个实例，则 panic（ambiguous config）。
+	// 如果都没设置，心跳报告中 CPU/Memory 字段为 0。
 	var sysInfoProvider SysInfoProvider
 	var tunerSysInfoProvider SysInfoProvider
 	if sis, ok := options.Tuner.GetWorkflowTaskSlotSupplier().(HasSysInfoProvider); ok {
@@ -2431,15 +2596,26 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 		sysInfoProvider = tunerSysInfoProvider
 	}
 
+	// =========================================================================
+	// 阶段 11：构造心跳回调（heartbeatCallback）
+	// =========================================================================
+	// 心跳回调是一个无参函数，每次被调用时生成一个 WorkerHeartbeat protobuf 消息。
+	// 它在心跳 goroutine 中和 Shutdown 路径上被并发调用，所以内部用 mu 保护可变状态。
+	// 仅在 client.workerHeartbeatInterval != 0 时才创建（即用户显式启用了心跳）。
 	var heartbeatCallback func() *workerpb.WorkerHeartbeat
 	if client.workerHeartbeatInterval != 0 {
-		startTime := timestamppb.New(time.Now())
+		// --- 11a. 初始化心跳中的静态/半静态字段 ---
+		startTime := timestamppb.New(time.Now()) // Worker 启动时间（在整个心跳生命周期中不变）
 		hostname, _ := os.Hostname()
 		pid := strconv.Itoa(os.Getpid())
-		previousHeartbeatTime := time.Now()
+		previousHeartbeatTime := time.Now() // 上一次心跳时间（每次心跳后更新）
 		pluginInfos := collectPluginInfos(client.clientPluginNames, plugins)
 		driverInfos := collectStorageDriverInfos(client.storageDriverTypes)
 
+		// --- 11b. 累计指标的"上一次快照"变量 ---
+		// 这些变量用于计算两次心跳之间的增量（例如本次心跳间隔内处理了多少 task）。
+		// 它们通过 populateOpts 指针传入 heartbeatMetrics.PopulateHeartbeat，
+		// PopulateHeartbeat 会读取当前累计值、计算增量，然后更新这些变量为当前值。
 		var prevWorkflowProcessed, prevWorkflowFailed int64
 		var prevActivityProcessed, prevActivityFailed int64
 		var prevLocalActivityProcessed, prevLocalActivityFailed int64
@@ -2460,6 +2636,9 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 			pollTimeTracker:            workerParams.pollTimeTracker,
 		}
 
+		// --- 11c. 部署版本信息 ---
+		// 如果启用了 Worker Versioning，将 DeploymentName + BuildID 附加到心跳中，
+		// Server 端用于基于版本的流量路由。
 		var deploymentVersion *deploymentpb.WorkerDeploymentVersion
 		if options.DeploymentOptions.UseVersioning {
 			deploymentVersion = &deploymentpb.WorkerDeploymentVersion{
@@ -2468,14 +2647,21 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 			}
 		}
 
-		// The callback can be invoked concurrently from the heartbeat worker goroutine and the shutdown path
-		var mu sync.Mutex
+		// --- 11d. heartbeatCallback 闭包 ---
+		// 此闭包每次被调用时：
+		//   1. 采集当前 CPU/内存使用率
+		//   2. 读取各子 Worker 的 SlotSupplier 类型
+		//   3. 计算距上次心跳的时间间隔
+		//   4. 根据 shuttingDown 状态设置 Worker 状态（RUNNING / SHUTTING_DOWN）
+		//   5. 填充累计指标增量（通过 heartbeatMetrics.PopulateHeartbeat）
+		var mu sync.Mutex // 保护闭包内的可变状态（populateOpts 中的 slotSupplierKind + previousHeartbeatTime）
 		heartbeatCallback = func() *workerpb.WorkerHeartbeat {
 			cpuUsage := getCpuUsage(sysInfoProvider, workerParams.Logger)
 			memUsage := getMemUsage(sysInfoProvider, workerParams.Logger)
 
 			mu.Lock()
 			defer mu.Unlock()
+			// 动态读取各子 Worker 的 SlotSupplier 类型（可能在运行时变化）
 			if aw.workflowWorker != nil {
 				populateOpts.workflowSlotSupplierKind = aw.workflowWorker.worker.slotSupplier.GetSlotSupplierKind()
 				populateOpts.localActivitySlotSupplierKind = aw.workflowWorker.localActivityWorker.slotSupplier.GetSlotSupplierKind()
@@ -2516,21 +2702,28 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 				Plugins:                   pluginInfos,
 				Drivers:                   driverInfos,
 			}
+			// PopulateHeartbeat 会从各 Worker 的指标计数器中读取当前累计值，
+			// 与 prev* 变量对比得到增量，写入心跳消息，然后更新 prev* 变量。
 			aw.heartbeatMetrics.PopulateHeartbeat(hb, populateOpts)
 
 			return hb
 		}
 	}
 
+	// =========================================================================
+	// 阶段 12：组装 AggregatedWorker 结构体
+	// =========================================================================
+	// 将前面创建的所有组件和子 Worker 聚合在一起，形成完整的 AggregatedWorker。
 	aw = &AggregatedWorker{
 		client:                       client,
 		workflowWorker:               workflowWorker,
 		activityWorker:               activityWorker,
 		sessionWorker:                sessionWorker,
+		// nexusWorker 不在这里创建：它的创建时机在 start() 中（详见阶段 13 注释）。
 		logger:                       workerParams.Logger,
 		registry:                     registry,
-		stopC:                        make(chan struct{}),
-		capabilities:                 &capabilities,
+		stopC:                        make(chan struct{}), // 创建一个未关闭的 channel，供 Stop() 通知用
+		capabilities:                 &capabilities,       // 指针，start() 中填充
 		executionParams:              workerParams,
 		workerInstanceKey:            workerInstanceKey,
 		plugins:                      plugins,
@@ -2540,16 +2733,54 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 		workerPollCompleteOnShutdown: workerPollCompleteOnShutdown,
 	}
 
-	// Set memoized start as a once-value that invokes plugins first
+	// =========================================================================
+	// 阶段 13：包装 memoizedStart（插件洋葱模型 + sync.OnceValue）
+	// =========================================================================
+	//
+	// memoizedStart 的设计分两层：
+	//
+	// 【外层 — sync.OnceValue】
+	//   sync.OnceValue 确保 start() 函数只会被执行一次。后续调用直接返回缓存的 error。
+	//   这里用 OnceValue 而非 Once(func()) error，是因为需要缓存返回值。
+	//
+	// 【内层 — Plugin 洋葱模型】
+	//   插件列表按注册顺序排列（先 Client 后 Worker）。在 StartWorker 钩子中，
+	//   期望的执行顺序是：后注册的插件先执行外层逻辑。
+	//   所以这里从后往前遍历，用一个闭包链实现"洋葱皮"式的层层包裹：
+	//
+	//       插件N.StartWorker → 插件N-1.StartWorker → ... → 插件1.StartWorker → aw.start()
+	//
+	//   每个插件的 StartWorker 可以：
+	//     a) 在调用 next() 之前做一些事情（如初始化资源）
+	//     b) 调用 next() 触发下一层（或真正的 start）
+	//     c) 在调用 next() 之后做一些事情（如注册清理钩子）
+	//
+	//   最后一个被包裹的是 aw.start()（真正的核心启动逻辑），它负责：
+	//     - 确保与 Server 的连接已初始化
+	//     - 拉取 Server Capabilities 和 Namespace 数据
+	//     - 设置 Payload 大小限制
+	//     - 按顺序启动 workflowWorker → activityWorker → sessionWorker → nexusWorker
+	//     - 注册心跳 Worker
+	//
+	// 【为什么 nexusWorker 不在这里创建，而在 start() 中？】
+	//   因为 start() 中会调用 registry.getRegisteredNexusServices() 检查是否有
+	//   已注册的 Nexus Service。Nexus Worker 的创建由"是否注册了 Service"来决定。
+	//   如果在 NewAggregatedWorker 时还没有注册任何 Service（常见场景），
+	//   就使用 nil 占位。在 Start() -> start() 时，如果发现有注册的 Nexus Service，
+	//   才真正创建并启动 Nexus Worker。
 	aw.memoizedStart = sync.OnceValue(func() error {
+		// start 初始化为真正的核心启动函数
 		start := func(context.Context, WorkerPluginStartWorkerOptions) error { return aw.start() }
+		// 从后往前遍历插件，将每个插件的 StartWorker 作为"洋葱皮"逐层包裹
 		for i := len(plugins) - 1; i >= 0; i-- {
 			plugin := plugins[i]
-			next := start
+			next := start // 保存当前层（内层）
 			start = func(ctx context.Context, options WorkerPluginStartWorkerOptions) error {
+				// 调用插件的 StartWorker，传入 next 让插件决定何时调用内层
 				return plugin.StartWorker(ctx, options, next)
 			}
 		}
+		// 执行最外层的 start（即被所有插件包裹后的核心启动逻辑）
 		return start(context.Background(), WorkerPluginStartWorkerOptions{
 			WorkerInstanceKey: workerInstanceKey,
 			WorkerRegistry:    aw,

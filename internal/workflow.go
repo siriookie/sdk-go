@@ -1008,32 +1008,63 @@ func (wc *workflowEnvironmentInterceptor) Init(outbound WorkflowOutboundIntercep
 // You can cancel the pending activity using context(workflow.WithCancel(ctx)) and that will fail the activity with
 // *CanceledError set as cause for *ActivityError.
 //
-// ExecuteActivity returns Future with activity result or failure.
+// ExecuteActivity 在 Workflow 内部调度一个 Activity 执行。
+//
+// 入参 activity 可以是 Activity 函数本身，也可以是它的注册名（字符串）。
+// 返回值 Future 可用于等待 Activity 完成并获取结果。
+//
+// 调用链路：
+//   ExecuteActivity (公开 API)
+//     → 解析 activityType（函数名或别名）
+//     → i.ExecuteActivity (OutboundInterceptor，可被用户拦截器包装)
+//       → workflowEnvironmentInterceptor.ExecuteActivity (核心实现)
 //
 // Exposed as: [go.temporal.io/sdk/workflow.ExecuteActivity]
 func ExecuteActivity(ctx Context, activity interface{}, args ...interface{}) Future {
+	// 只读副本（Replay）中不允许触发新的 Activity，直接 panic
 	assertNotInReadOnlyState(ctx)
 	i := getWorkflowOutboundInterceptor(ctx)
 	registry := getRegistryFromWorkflowContext(ctx)
+	// 将 activity 参数解析为 Activity 类型的名称：
+	//   - 如果是字符串 → 直接用作名称（支持 alias）
+	//   - 如果是函数 → 提取函数名，查 alias 表
 	activityType := getActivityFunctionName(registry, activity)
-	// Put header on context before executing
+	// 在 context 上附加空的 Header（用于 ContextPropagator 跨进程传递链路信息）
 	ctx = workflowContextWithNewHeader(ctx)
 	return i.ExecuteActivity(ctx, activityType, args...)
 }
 
+// ExecuteActivity 是 Activity 调度的核心实现（OutboundInterceptor 的默认实现）。
+//
+// 执行流程分为以下几个阶段：
+//   1. 校验 Activity 类型和参数
+//   2. 解析 ActivityOptions（超时、重试、TaskQueue 等）
+//   3. 处理 Session 状态（如有）
+//   4. 传播 Context Header（链路上下文）
+//   5. 序列化参数 → 构造 ExecuteActivityParams
+//   6. 注册取消回调（Context 取消 → 向 Server 请求取消 Activity）
+//   7. 调用环境层 env.ExecuteActivity() 提交任务
 func (wc *workflowEnvironmentInterceptor) ExecuteActivity(ctx Context, typeName string, args ...interface{}) Future {
-	// Validate type and its arguments.
+	// ===== 阶段 1：校验 Activity 类型 + 参数 =====
 	registry := getRegistryFromWorkflowContext(ctx)
 	future, settable := newDecodeFuture(ctx, typeName)
+	// getValidatedActivityFunction 做了两件事：
+	//   a) 如果 typeName 是函数引用 → 校验参数类型匹配，获取函数名
+	//   b) 如果是字符串 → 直接用作名称
 	activityType, err := getValidatedActivityFunction(typeName, args, registry)
 	if err != nil {
 		settable.Set(nil, err)
 		return future
 	}
-	// Validate context options.
+
+	// ===== 阶段 2：解析 Activity 配置选项 =====
+	// options 来自 context 上通过 WithActivityOptions 设置的配置
 	options := getActivityOptions(ctx)
 
-	// Validate session state.
+	// ===== 阶段 3：Session 状态处理 =====
+	// Session 保证一组 Activity 在同一个 Worker 上执行。
+	//  - SessionStateOpen：将 TaskQueue 临时改为 Session 专用的 TaskQueue（确保路由到同一 Worker）
+	//  - SessionStateFailed：非创建 Activity 直接返回 ErrSessionFailed
 	if sessionInfo := getSessionInfo(ctx); sessionInfo != nil {
 		isCreationActivity := isSessionCreationActivity(typeName)
 		if sessionInfo.SessionState == SessionStateFailed && !isCreationActivity {
@@ -1041,7 +1072,7 @@ func (wc *workflowEnvironmentInterceptor) ExecuteActivity(ctx Context, typeName 
 			return future
 		}
 		if sessionInfo.SessionState == SessionStateOpen && !isCreationActivity {
-			// Use session taskqueue
+			// 临时替换 TaskQueue 为 Session 的 TaskQueue，确保此 Activity 被路由到持有 Session 的 Worker
 			oldTaskQueueName := options.TaskQueueName
 			options.TaskQueueName = sessionInfo.taskqueue
 			defer func() {
@@ -1050,7 +1081,9 @@ func (wc *workflowEnvironmentInterceptor) ExecuteActivity(ctx Context, typeName 
 		}
 	}
 
-	// Retrieve headers from context to pass them on
+	// ===== 阶段 4：传播 Context Header =====
+	// ContextPropagator 用于跨进程传播链路信息（如 OpenTracing 的 SpanContext）。
+	// 从当前 Workflow Context 中提取 Header，传递给 Activity Worker。
 	envOptions := getWorkflowEnvOptions(ctx)
 	header, err := workflowHeaderPropagated(ctx, envOptions.ContextPropagators)
 	if err != nil {
@@ -1058,33 +1091,37 @@ func (wc *workflowEnvironmentInterceptor) ExecuteActivity(ctx Context, typeName 
 		return future
 	}
 
+	// ===== 阶段 5：构造 ExecuteActivityParams =====
 	env := getWorkflowEnvironment(ctx)
-	// Generate activity ID before serialization so it's available to context-aware data converters
+	// 在序列化参数之前生成 ActivityID，使得 context-aware DataConverter 可以访问到它
 	scheduleID := env.GenerateSequence()
 	var activityID string
 	if options.ActivityID != "" {
 		activityID = options.ActivityID
 	} else {
-		activityID = getStringID(scheduleID)
+		activityID = getStringID(scheduleID) // 默认格式：strconv.Itoa(scheduleID)
 	}
 	wfInfo := env.WorkflowInfo()
+	// ActivitySerializationContext 提供给 DataConverter，用于按 Activity 维度进行序列化定制
 	actCtx := converter.ActivitySerializationContext{
 		Namespace:    wfInfo.Namespace,
 		WorkflowID:   wfInfo.WorkflowExecution.ID,
 		WorkflowType: wfInfo.WorkflowType.Name,
 		ActivityType: activityType.Name,
 		TaskQueue:    cmp.Or(options.TaskQueueName, wfInfo.TaskQueueName),
-		IsLocal:      false,
+		IsLocal:      false, // 远程 Activity，需要真正的序列化
 	}
 	dataConverter := converter.WithDataConverterSerializationContext(
 		getDataConverterFromWorkflowContext(ctx),
 		actCtx,
 	)
+	// 将 DataConverter 存入 future，供 decodeFuture.Get() 反序列化结果时使用
 	future.(*decodeFutureImpl).dataConverter = dataConverter
 
+	// 编码参数为 *commonpb.Payloads
 	input, err := encodeArgs(dataConverter, args)
 	if err != nil {
-		panic(err)
+		panic(err) // 序列化失败视为编程错误，直接 panic
 	}
 
 	params := ExecuteActivityParams{
@@ -1098,16 +1135,21 @@ func (wc *workflowEnvironmentInterceptor) ExecuteActivity(ctx Context, typeName 
 	params.ActivityID = activityID
 	params.ScheduleID = scheduleID
 
+	// ===== 阶段 6：注册取消回调 + 提交任务 =====
+	// 传入回调函数：当 Activity 完成（成功或失败）时，settable.Set() 通知 Future 就绪。
+	// 同时清理 cancellation callback（Activity 已结束，不再需要取消监听）。
 	ctxDone, cancellable := ctx.Done().(*channelImpl)
 	cancellationCallback := &receiveCallback{}
 	a := getWorkflowEnvironment(ctx).ExecuteActivity(params, func(r *commonpb.Payloads, e error) {
 		settable.Set(r, e)
 		if cancellable {
-			// future is done, we don't need the cancellation callback anymore.
+			// Activity 已完成，移除取消回调避免内存泄漏
 			ctxDone.removeReceiveCallback(cancellationCallback)
 		}
 	})
 
+	// 如果 context 是可取消的（用户调用了 workflow.WithCancel(ctx)），
+	// 注册取消回调：当 context.Done() 被触发时 → RequestCancelActivity 通知 Server 取消该 Activity。
 	if cancellable {
 		cancellationCallback.fn = func(v interface{}, more bool) bool {
 			assertNotInReadOnlyStateCancellation(ctx)
@@ -1116,6 +1158,8 @@ func (wc *workflowEnvironmentInterceptor) ExecuteActivity(ctx Context, typeName 
 			}
 			return false
 		}
+		// receiveAsyncImpl 将回调注册到 ctx.Done() channel 上，
+		// 同时检查 ctx 是否已经被取消（立即触发回调）。
 		_, ok, more := ctxDone.receiveAsyncImpl(cancellationCallback)
 		if ok || !more {
 			cancellationCallback.fn(nil, more)
@@ -1158,36 +1202,65 @@ func (wc *workflowEnvironmentInterceptor) ExecuteActivity(ctx Context, typeName 
 // You can cancel the pending activity using context(workflow.WithCancel(ctx)) and that will fail the activity with
 // *CanceledError set as cause for *ActivityError.
 //
-// ExecuteLocalActivity returns Future with local activity result or failure.
+// ExecuteLocalActivity 在 Workflow 内部调度一个本地 Activity（Local Activity）。
+//
+// 与普通（远程）Activity 的关键区别：
+//   - 由 Workflow Worker 本地执行，不需要经过 Temporal Server 的任务队列调度
+//   - 参数直接传递函数指针，无需序列化（结果仍需序列化记录到 History 中，保证 Replay 一致性）
+//   - 不能 Heartbeat，适用于短时间（秒级）执行的操作
+//   - 支持自动重试（通过 needRetryError 信号，在 ExecuteLocalActivity 的 Go 协程中循环）
+//
+// 调用链路：
+//   ExecuteLocalActivity (公开 API)
+//     → 解析 activityType + 构建 localActivityContext
+//     → i.ExecuteLocalActivity (OutboundInterceptor)
+//       → workflowEnvironmentInterceptor.ExecuteLocalActivity (重试循环 + 函数解析)
+//         → scheduleLocalActivity (单次提交 + 取消处理)
 //
 // Exposed as: [go.temporal.io/sdk/workflow.ExecuteLocalActivity]
 func ExecuteLocalActivity(ctx Context, activity interface{}, args ...interface{}) Future {
 	assertNotInReadOnlyState(ctx)
 	i := getWorkflowOutboundInterceptor(ctx)
 	env := getWorkflowEnvironment(ctx)
+	// 提取函数名 + 判断是否是 method 类型（method 类型的 activity 需要从 registry 中查找注册信息）
 	activityType, isMethod := getFunctionName(activity)
 	if alias, ok := env.GetRegistry().getActivityAlias(activityType); ok {
-		activityType = alias
+		activityType = alias // 支持别名映射
 	}
 	var fn interface{}
 	if _, ok := activity.(string); ok {
-		fn = nil
+		fn = nil // 字符串类型：仅知道名称，函数在 registry 中
 	} else {
-		fn = activity
+		fn = activity // 函数类型：保存函数引用
 	}
+	// 将函数/方法信息打包存入 context，供 ExecuteLocalActivity 的核心实现使用
 	localCtx := &localActivityContext{
 		fn:       fn,
 		isMethod: isMethod,
 	}
 	ctx = WithValue(ctx, localActivityFnContextKey, localCtx)
-	// Put header on context before executing
+	// 附加 Header 传播用的容器
 	ctx = workflowContextWithNewHeader(ctx)
 	return i.ExecuteLocalActivity(ctx, activityType, args...)
 }
 
+// ExecuteLocalActivity 是 Local Activity 调度的核心实现。
+//
+// 与普通 Activity 的核心区别在于重试机制：
+//   普通 Activity 的重试由 Server 端处理，Workflow 侧无感知。
+//   而 Local Activity 没有 Server 参与调度，所以重试逻辑完全在 SDK 侧实现。
+//
+// 整体流程：
+//   1. 传播 Header → 2. 解析 Activity 函数（3 种分支）
+//      → 3. 校验 LocalActivityOptions → 4. 构造参数
+//      → 5. 启动 Go 协程进入 retry loop
+//        → 每次循环调用 scheduleLocalActivity 提交单次执行
+//        → 如果返回 needRetryError → Sleep + 递增 Attempt → continue
+//        → 否则 settable.Set() 结束 Future
 func (wc *workflowEnvironmentInterceptor) ExecuteLocalActivity(ctx Context, typeName string, args ...interface{}) Future {
 	future, settable := newDecodeFuture(ctx, typeName)
 
+	// ===== 步骤 1：传播 Context Header =====
 	envOptions := getWorkflowEnvOptions(ctx)
 	header, err := workflowHeaderPropagated(ctx, envOptions.ContextPropagators)
 	if err != nil {
@@ -1195,6 +1268,24 @@ func (wc *workflowEnvironmentInterceptor) ExecuteLocalActivity(ctx Context, type
 		return future
 	}
 
+	// ===== 步骤 2：解析 Activity 函数（三路分支） =====
+	// 根据 ExecuteLocalActivity 传入的 localActivityContext 决定如何获取实际的执行函数。
+	//
+	// localActivityContext 的关键字段：
+	//   - fn: activity 的函数引用（nil 表示仅传入了字符串名称）
+	//   - isMethod: 是否为方法（即绑定了 receiver 的函数）
+	//
+	// 分支 A（isMethod=true）：方法类型 Activity
+	//   优先从 registry 中查找注册信息获取无 receiver 的函数；
+	//   如果未注册，使用原始函数（兼容历史行为——允许非 nil receiver 的 Local Activity）
+	//
+	// 分支 B（fn==nil）：传入了字符串名称
+	//   - 从 registry 查找已注册的函数
+	//   - 如果找不到且在 Replay Namespace → 使用 dummy 函数（Replay 不需要真正执行）
+	//   - 否则报告未注册错误
+	//
+	// 分支 C（else）：传入了函数引用
+	//   校验参数类型 → 直接使用该函数
 	var activityFn interface{}
 	localCtx := ctx.Value(localActivityFnContextKey).(*localActivityContext)
 	if localCtx == nil {
@@ -1202,14 +1293,14 @@ func (wc *workflowEnvironmentInterceptor) ExecuteLocalActivity(ctx Context, type
 	}
 
 	if localCtx.isMethod {
+		// ----- 分支 A：方法类型 Activity -----
 		registry := getRegistryFromWorkflowContext(ctx)
 		activity, ok := registry.GetActivity(typeName)
-		// Uses registered function if found as the registration is required with a nil receiver.
-		// Calls function directly if not registered. It is to support legacy applications
-		// that called local activities using non nil receiver.
 		if ok {
+			// 已注册 → 使用注册的 GetFunction()（返回无 receiver 的函数，因为注册时 receiver 为 nil）
 			activityFn = activity.GetFunction()
 		} else {
+			// 未注册 → 兼容旧版本行为，使用原始函数引用（可能有非 nil receiver）
 			if err := validateFunctionArgs(localCtx.fn, args, false); err != nil {
 				settable.Set(nil, err)
 				return future
@@ -1217,6 +1308,7 @@ func (wc *workflowEnvironmentInterceptor) ExecuteLocalActivity(ctx Context, type
 			activityFn = localCtx.fn
 		}
 	} else if localCtx.fn == nil {
+		// ----- 分支 B：字符串名称 -----
 		registry := getRegistryFromWorkflowContext(ctx)
 		activityType, err := getValidatedActivityFunction(typeName, args, registry)
 		if err != nil {
@@ -1227,28 +1319,29 @@ func (wc *workflowEnvironmentInterceptor) ExecuteLocalActivity(ctx Context, type
 		if ok {
 			activityFn = activity.GetFunction()
 		} else if IsReplayNamespace(GetWorkflowInfo(ctx).Namespace) {
-			// When running the replayer (but not necessarily during all replays), we
-			// don't require the activities to be registered, so use a dummy function
+			// Replay 模式下，本地 Activity 不需要真正执行，因为 History 中已有结果记录
 			activityFn = func(context.Context) error { panic("dummy replayer function") }
 		} else {
 			settable.Set(nil, fmt.Errorf("local activity %s is not registered by the worker", activityType.Name))
 			return future
 		}
 	} else {
+		// ----- 分支 C：直接传入函数引用 -----
 		if err := validateFunctionArgs(localCtx.fn, args, false); err != nil {
 			settable.Set(nil, err)
 			return future
 		}
-
 		activityFn = localCtx.fn
 	}
 
+	// ===== 步骤 3：校验 LocalActivityOptions =====
 	options, err := getValidatedLocalActivityOptions(ctx)
 	if err != nil {
 		settable.Set(nil, err)
 		return future
 	}
 
+	// ===== 步骤 4：构造执行参数 =====
 	env := getWorkflowEnvironment(ctx)
 	wfInfo := env.WorkflowInfo()
 	actCtx := converter.ActivitySerializationContext{
@@ -1257,36 +1350,46 @@ func (wc *workflowEnvironmentInterceptor) ExecuteLocalActivity(ctx Context, type
 		WorkflowType: wfInfo.WorkflowType.Name,
 		ActivityType: typeName,
 		TaskQueue:    wfInfo.TaskQueueName,
-		IsLocal:      true,
+		IsLocal:      true, // 标记为本地 Activity
 	}
 
 	params := &ExecuteLocalActivityParams{
 		ExecuteLocalActivityOptions: *options,
 		ActivityFn:                  activityFn,
 		ActivityType:                typeName,
-		InputArgs:                   args,
+		InputArgs:                   args,       // 注意：Local Activity 的参数不经过序列化，直接传递 Go 对象
 		WorkflowInfo:                wfInfo,
 		DataConverter:               converter.WithDataConverterSerializationContext(getDataConverterFromWorkflowContext(ctx), actCtx),
 		FailureConverter:            converter.WithFailureConverterSerializationContext(wc.env.GetFailureConverter(), actCtx),
-		ScheduledTime:               Now(ctx), // initial scheduled time
+		ScheduledTime:               Now(ctx),   // 初始调度时间
 		Header:                      header,
-		Attempt:                     1, // Attempts always start at one
+		Attempt:                     1,          // 尝试次数从 1 开始（符合 Temporal 惯例）
 	}
 
+	// ===== 步骤 5：启动重试循环（在独立的 Workflow 协程中） =====
+	// Go(ctx, fn) 启动一个被 Workflow 确定性框架管理的 goroutine。
+	// 循环语义：
+	//   - 调用 scheduleLocalActivity 提交一次执行
+	//   - 等待 f.Get() 完成
+	//   - 如果返回 needRetryError 且有正 Backoff → Sleep + 更新 Attempt → 重试
+	//   - 否则（成功、取消、非重试错误、Backoff <= 0）→ settable.Set() 结束 Future
+	//
+	// needRetryError 由 Local Activity 执行器在以下情况下产生：
+	//   - Local Activity 执行失败，且 RetryPolicy 允许重试
+	//   - Backoff 字段是计算出的退避时间
 	Go(ctx, func(ctx Context) {
 		for {
 			f := wc.scheduleLocalActivity(ctx, params)
 			var result *commonpb.Payloads
 			err := f.Get(ctx, &result)
 			if retryErr, ok := err.(*needRetryError); ok && retryErr.Backoff > 0 {
-				// Backoff for retry
+				// 需要重试：Sleep 退避时间，然后递增 Attempt 进入下一轮
 				_ = Sleep(ctx, retryErr.Backoff)
-				// increase the attempt, and retry the local activity
 				params.Attempt = retryErr.Attempt + 1
 				continue
 			}
 
-			// not more retry, return whatever is received.
+			// 不需要重试（成功 / 不可重试错误 / 取消）
 			settable.Set(result, err)
 			return
 		}
@@ -1295,34 +1398,61 @@ func (wc *workflowEnvironmentInterceptor) ExecuteLocalActivity(ctx Context, type
 	return future
 }
 
+// needRetryError 是 Local Activity 重试机制的信号错误。
+// 它不是真正的错误，而是 ExecuteLocalActivity 的 retry loop 和 scheduleLocalActivity 之间的
+// 通信协议：当 Local Activity 执行失败但 RetryPolicy 允许重试时，scheduleLocalActivity 通过
+// Future.Set(nil, &needRetryError{...}) 向上传递重试参数（退避时间 + 当前尝试次数）。
+// 上层的 retry loop 检查到 needRetryError 后执行 Sleep + Attempt++ 再重试。
 type needRetryError struct {
-	Backoff time.Duration
-	Attempt int32
+	Backoff time.Duration // 本次重试需要等待的退避时间
+	Attempt int32         // 本次失败的尝试次数（下次尝试 = Attempt + 1）
 }
 
 func (e *needRetryError) Error() string {
 	return fmt.Sprintf("Retry backoff: %v, Attempt: %v", e.Backoff, e.Attempt)
 }
 
+// scheduleLocalActivity 提交一次 Local Activity 的"单次执行"到环境层。
+//
+// 它只负责一次执行（不处理重试），重试逻辑由调用方 ExecuteLocalActivity 的 retry loop 负责。
+//
+// 返回值 Future 的可能状态：
+//   1. 成功 → 结果 result
+//   2. 被取消 → IsCanceledError(err) 为 true
+//   3. 需要重试 → err 是 *needRetryError（Backoff > 0）
+//   4. 不可重试的失败 → err 是普通错误
+//
+// 取消机制：如果 ctx 可取消，注册回调到 ctx.Done() channel，
+// 当 Workflow 被取消时调用 RequestCancelLocalActivity 通知环境层。
 func (wc *workflowEnvironmentInterceptor) scheduleLocalActivity(ctx Context, params *ExecuteLocalActivityParams) Future {
+	// 使用 futureImpl（而非 decodeFutureImpl）：Local Activity 的 result 已经由环境层反序列化好，
+	// 不需要再做 DataConverter 解码。
 	f := &futureImpl{channel: NewChannel(ctx).(*channelImpl)}
 	ctxDone, cancellable := ctx.Done().(*channelImpl)
 	cancellationCallback := &receiveCallback{}
+
+	// 向环境层提交 Local Activity 执行，传入完成回调
 	la := wc.env.ExecuteLocalActivity(*params, func(lar *LocalActivityResultWrapper) {
 		if cancellable {
-			// future is done, we don't need cancellation anymore
+			// 执行完成（无论成功/失败/取消），移除取消回调避免内存泄漏
 			ctxDone.removeReceiveCallback(cancellationCallback)
 		}
 
+		// 判断是否需要重试的条件：
+		//   - 成功（lar.Err == nil）→ 不重试
+		//   - 被取消 → 不重试（取消是不可恢复的）
+		//   - Backoff <= 0 → 重试已耗尽（或不可重试的错误）
+		// 只有这几种情况直接 Set 结果，其余包装为 needRetryError 向上传递
 		if lar.Err == nil || IsCanceledError(lar.Err) || lar.Backoff <= 0 {
 			f.Set(lar.Result, lar.Err)
 			return
 		}
 
-		// set retry error, and it will be handled by workflow.ExecuteLocalActivity().
+		// 包装为 needRetryError → 通知 ExecuteLocalActivity 的 retry loop 进行重试
 		f.Set(nil, &needRetryError{Backoff: lar.Backoff, Attempt: lar.Attempt})
 	})
 
+	// 注册取消回调：当 ctx 被取消时，请求取消正在执行的 Local Activity
 	if cancellable {
 		cancellationCallback.fn = func(v interface{}, more bool) bool {
 			assertNotInReadOnlyStateCancellation(ctx)
@@ -1331,6 +1461,7 @@ func (wc *workflowEnvironmentInterceptor) scheduleLocalActivity(ctx Context, par
 			}
 			return false
 		}
+		// receiveAsyncImpl 注册回调，同时检查 ctx 是否已经被取消
 		_, ok, more := ctxDone.receiveAsyncImpl(cancellationCallback)
 		if ok || !more {
 			cancellationCallback.fn(nil, more)

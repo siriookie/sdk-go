@@ -301,7 +301,26 @@ func (bp *basePoller) shouldDrainOnShutdown() bool {
 //   - poll succeeds
 //   - poll fails
 //   - worker is stopping
+//
+// doPoll 执行一次带 context 的 gRPC 长轮询调用。
+//
+// pollFunc 是具体的 Poll 函数（如 PollWorkflowTaskQueue / PollActivityTaskQueue），
+// 在独立 goroutine 中异步执行。当前 goroutine 通过 select 监听两种结果：
+//   - doneC: Poll 完成（成功或失败）
+//   - stopC: Worker 正在停止
+//
+// Shutdown 行为分两种模式（由 Server Capabilities 的 WorkerPollCompleteOnShutdown 决定）：
+//
+//   【新模式】workerPollCompleteOnShutdown == true
+//     Server 收到 ShutdownWorker RPC 后会返回空响应来结束 Poll。
+//     因此收到 stopC 后不立即 cancel，而是等 5 秒让 Server 自然完成 Poll。
+//     5 秒超时后兜底 cancel（防止 gRPC 连接已断开导致永不等完成）。
+//
+//   【旧模式】workerPollCompleteOnShutdown == false (legacy)
+//     Server 不支持此特性，收到 stopC 后立即 cancel gRPC context，
+//     直接返回 errStop。
 func (bp *basePoller) doPoll(pollFunc func(ctx context.Context) (taskForWorker, error)) (taskForWorker, error) {
+	// 快速路径：如果 Worker 已经在停了，不要发起新的 Poll
 	if bp.stopping() {
 		return nil, errStop
 	}
@@ -310,8 +329,10 @@ func (bp *basePoller) doPoll(pollFunc func(ctx context.Context) (taskForWorker, 
 	var result taskForWorker
 
 	doneC := make(chan struct{})
+	// 构造 gRPC context：带长轮询超时（如 60s）+ 长轮询标记
 	ctx, cancel := newGRPCContext(context.Background(), grpcTimeout(pollTaskServiceTimeOut), grpcLongPoll(true))
 
+	// Poll 在独立 goroutine 中异步执行——主 goroutine 用 select 同时监听 doneC 和 stopC
 	go func() {
 		result, err = pollFunc(ctx)
 		cancel()
@@ -327,11 +348,12 @@ func (bp *basePoller) doPoll(pollFunc func(ctx context.Context) (taskForWorker, 
 		return result, err
 	}
 
-	// Legacy: cancel in-flight polls immediately on shutdown
+	// ===== 旧模式：立即 cancel（legacy） =====
 	select {
 	case <-doneC:
 		return result, err
 	case <-bp.stopC:
+		// Server 不支持自然完成 Poll → 直接 cancel gRPC context → 立刻返回
 		cancel()
 		return nil, errStop
 	}
@@ -444,38 +466,62 @@ func (wtp *workflowTaskProcessor) ProcessTask(task interface{}) error {
 }
 
 func (wtp *workflowTaskProcessor) processWorkflowTask(task *workflowTask) (retErr error) {
+	// task.task == nil 表示这次 poll 没拿到真正的 Workflow Task。
+	// 这种情况通常是长轮询超时/空响应；base worker 仍会把它当作一次空 task 交到这里。
 	if task.task == nil {
 		// We didn't have task, poll might have timeout.
 		traceLog(func() {
 			wtp.logger.Debug("Workflow task unavailable")
 		})
+		// 空 task 不需要回复 server，也不需要触发 workflow 执行。
 		return nil
 	}
 
+	// doneCh 用来通知 local activity worker：当前 workflow task 处理流程已经结束。
+	// 如果 workflow task 提前结束，local activity 的结果发送方不能永远阻塞在 laResultCh 上。
 	doneCh := make(chan struct{})
+	// laResultCh 用来接收 local activity 执行完成后的结果。
+	// workflow task handler 可能在处理 workflow task 时等待 local activity 结果。
 	laResultCh := make(chan *localActivityResult)
+	// laRetryCh 用来接收需要 retry 的 local activity task。
 	laRetryCh := make(chan *localActivityTask)
 	// close doneCh so local activity worker won't get blocked forever when trying to send back result to laResultCh.
+	// 无论函数怎么返回，都关闭 doneCh，释放 local activity 相关 goroutine。
 	defer close(doneCh)
 
+	// downloadPayloadMetrics 统计这次处理 workflow task 时，从外部 payload storage 下载 payload 的数量/大小/耗时。
 	downloadPayloadMetrics := &workflowTaskStorageMetrics{}
+	// 把 storage callback 放进 context，后面 inbound payload visitor 访问外部 payload 时会更新指标。
 	ctx := extstore.WithStorageOperationCallback(context.Background(), downloadPayloadMetrics)
 
+	// taskErr 表示 workflow task 处理过程中产生的错误。
+	// defer 里会根据它决定 workflow context 是否可继续缓存。
 	var taskErr error
+	// 在正式处理 task 之前，先遍历 poll response 里的 payload。
+	// inboundPayloadVisitor 可能会解密、解压、从外部 storage 拉 payload，或做 payload 校验。
 	if taskErr = visitProtoPayloads(ctx, wtp.inboundPayloadVisitor, task.task, wtp.payloadVisitorConcurrency); taskErr != nil {
+		// inbound payload 处理失败时，SDK 会尝试向 server 上报 query/workflow task 失败。
 		wtp.handleInboundVisitorError(task.task, taskErr)
+		// 错误已经通过 handleInboundVisitorError 处理，这里不再把错误返回给 baseWorker。
 		return nil
 	}
 
+	// 获取或创建这个 workflow execution 对应的本地 workflow context。
+	// 如果 sticky cache 命中，会复用已有 context；否则会创建新 context 并通过 history replay 恢复状态。
 	wfctx, err := wtp.contextManager.GetOrCreateWorkflowContext(task.task, task.historyIterator)
 	if err != nil {
+		// context 获取失败通常表示 history/replay/cache 状态有问题，交给上层记录处理。
 		return err
 	}
+	// 函数结束时必须 unlock workflow context。
+	// 如果处理过程中 panic 或出错，要把错误传给 Unlock，让缓存逻辑知道这个 context 不能安全复用。
 	defer func() {
 		// If we panic during processing the workflow task, we need to unlock the workflow context with an error to discard it.
 		if p := recover(); p != nil {
+			// workflow task 处理 panic 时，生成带 task queue 的 stack trace 标题。
 			topLine := fmt.Sprintf("workflow task for %s [panic]:", wtp.taskQueueName)
 			st := getStackTraceRaw(topLine, 7, 0)
+			// 记录 workflow id/run id/workflow type/attempt/panic/stack，方便定位是哪个 workflow task 崩了。
 			wtp.logger.Error("Workflow task processing panic.",
 				tagWorkflowID, task.task.WorkflowExecution.GetWorkflowId(),
 				tagRunID, task.task.WorkflowExecution.GetRunId(),
@@ -483,23 +529,41 @@ func (wtp *workflowTaskProcessor) processWorkflowTask(task *workflowTask) (retEr
 				tagAttempt, task.task.Attempt,
 				tagPanicError, fmt.Sprintf("%v", p),
 				tagPanicStack, st)
+			// 把 panic 转成 error，让后续 Unlock 丢弃该 workflow context。
 			taskErr = newPanicError(p, st)
+			// retErr 返回给 baseWorker，baseWorker 会记录 task processing failed。
 			retErr = taskErr
 		}
+		// 解锁 workflow context。
+		// taskErr == nil 时，context 可以继续留在 sticky cache；
+		// taskErr != nil 时，context 通常会被视为不安全并丢弃/重置。
 		wfctx.Unlock(taskErr)
 	}()
 
+	// 这个 for 循环用于处理“同一次 RespondWorkflowTaskCompleted 后 server 立即返回新 WorkflowTask”的情况。
+	// 例如 server 在 RespondWorkflowTaskCompletedResponse.WorkflowTask 中直接带回下一个 workflow task，
+	// SDK 可以不重新走 poll，继续在当前 goroutine 里处理新 task。
 	for {
+		// 记录本轮 workflow task 处理开始时间，用于执行耗时指标和慢 task 日志。
 		startTime := time.Now()
+		// 把 local activity 生命周期相关 channel 挂到当前 workflowTask 上。
+		// taskHandler.ProcessWorkflowTask 内部会用这些 channel 协调 local activity 结果/重试。
 		task.doneCh = doneCh
 		task.laResultCh = laResultCh
 		task.laRetryCh = laRetryCh
+		// taskCompletion 是 taskHandler 处理后生成的响应包装：
+		// 可能是 RespondWorkflowTaskCompleted、RespondWorkflowTaskFailed 或 RespondQueryTaskCompleted。
 		var taskCompletion *workflowTaskCompletion
+		// 调用 WorkflowTaskHandler 处理当前 workflow task。
+		// 这里会 replay history、执行 workflow 代码/query handler、生成 commands 或 failure response。
 		taskCompletion, taskErr = wtp.taskHandler.ProcessWorkflowTask(
 			task,
 			wfctx,
+			// 这个 callback 是 workflow task heartbeat/force complete 路径使用的。
+			// 当 handler 需要中途强制 RespondWorkflowTaskCompleted 时，通过它把当前 completion 先发给 server。
 			func(taskCompletion *workflowTaskCompletion, startTime time.Time) (*workflowTask, error) {
 				wtp.logger.Debug("Force RespondWorkflowTaskCompleted.", "TaskStartedEventID", task.task.GetStartedEventId())
+				// 把当前 completion 发回 server，并记录 metrics。
 				heartbeatResponse, err := wtp.RespondTaskCompletedWithMetrics(
 					taskCompletion,
 					nil,
@@ -510,26 +574,38 @@ func (wtp *workflowTaskProcessor) processWorkflowTask(task *workflowTask) (retEr
 				if err != nil {
 					return nil, err
 				}
+				// server 没有在 heartbeat response 里带新 workflow task，说明当前没有可继续处理的 task。
 				if heartbeatResponse == nil || heartbeatResponse.WorkflowTask == nil {
 					return nil, nil
 				}
+				// server 返回了新 workflow task，把公开 API response 包装成 SDK 内部 workflowTask。
 				task := wtp.toWorkflowTask(heartbeatResponse.WorkflowTask)
+				// 新 task 也要先处理 inbound payload。
 				if err := visitProtoPayloads(ctx, wtp.inboundPayloadVisitor, task.task, wtp.payloadVisitorConcurrency); err != nil {
 					wtp.handleInboundVisitorError(task.task, err)
 					return nil, nil
 				}
+				// 复用同一组 local activity channel。
 				task.doneCh = doneCh
 				task.laResultCh = laResultCh
 				task.laRetryCh = laRetryCh
+				// 返回新 task 给 handler，让它继续处理。
 				return task, nil
 			},
 		)
+		// taskCompletion 和 taskErr 都为空，表示 handler 已经处理完但不需要回复 server。
+		// 例如某些空/无需处理路径。
 		if taskCompletion == nil && taskErr == nil {
 			return nil
 		}
+		// workflowTaskHeartbeatError 表示 heartbeat/force complete 路径已经决定返回错误。
+		// 这里直接返回，避免再走一次普通 RespondTaskCompletedWithMetrics。
 		if _, ok := taskErr.(workflowTaskHeartbeatError); ok {
 			return taskErr
 		}
+		// 正常完成或失败都通过这里统一回复 server：
+		// - taskErr == nil：发送 taskCompletion 中的 completed/query completed 请求；
+		// - taskErr != nil：转换为 RespondWorkflowTaskFailed。
 		response, err := wtp.RespondTaskCompletedWithMetrics(
 			taskCompletion,
 			taskErr,
@@ -539,20 +615,29 @@ func (wtp *workflowTaskProcessor) processWorkflowTask(task *workflowTask) (retEr
 			wfctx.workflowInfo)
 		if err != nil {
 			// If we get an error responding to the workflow task we need to evict the execution from the cache.
+			// 回复 server 失败时，不能继续信任本地 workflow context。
+			// 把 taskErr 设成 err，defer Unlock 会据此丢弃/重置 context。
 			taskErr = err
 			return err
 		}
 
+		// server 可能要求 SDK 把本地 workflow context 的 previous started event id 回退到某个 event。
+		// 这用于 history reset/修正 sticky replay 边界。
 		if eventLevel := response.GetResetHistoryEventId(); eventLevel != 0 {
 			wfctx.SetPreviousStartedEventID(eventLevel)
 		}
 
+		// 没有 response、response 没带新 workflow task，或者本轮 taskErr 非空，
+		// 都说明当前处理链路结束，不再继续循环。
 		if response == nil || response.WorkflowTask == nil || taskErr != nil {
 			return nil
 		}
 
 		// we are getting new workflow task, so reset the workflowTask and continue process the new one
+		// server 在 RespondWorkflowTaskCompletedResponse 里直接带回了新 workflow task。
+		// 这是一种避免重新 poll 的优化，继续循环处理它。
 		task = wtp.toWorkflowTask(response.WorkflowTask)
+		// 新 task 进入处理前同样要跑 inbound payload visitor。
 		if err := visitProtoPayloads(ctx, wtp.inboundPayloadVisitor, task.task, wtp.payloadVisitorConcurrency); err != nil {
 			wtp.handleInboundVisitorError(task.task, err)
 			return nil
@@ -1107,20 +1192,50 @@ func (wtp *workflowTaskPoller) updateBacklog(taskQueueKind enumspb.TaskQueueKind
 //     3.2. otherwise:
 //     3.2.1) if sticky task queue has backlog, always prefer to process sticky task first
 //     3.2.2) poll from the task queue that has less pending requests (prefer sticky when they are the same).
+// getNextPollRequest 根据 Poller 模式决定本次 Poll 请求的目标队列（Sticky 或 Normal）。
+//
+// WorkflowTask 有三种 Poller 模式（由 MaxConcurrentWorkflowTaskPollers 等配置决定）：
+//
+//   NonSticky — 永远只 Poll Normal Queue
+//       适用场景：Worker 未启用 Sticky（stickyCacheSize <= 0）
+//
+//   Sticky — 永远只 Poll Sticky Queue
+//       适用场景：Worker 被严格绑定到 Sticky（如只有 1 个 poller）
+//       Sticky Queue = Server 会把后续 Task 优先发给上次执行该 Workflow 的 Worker，
+//       利用本地缓存跳过 History replay。
+//
+//   Mixed — 动态在两种队列间切换（默认模式）
+//       决策规则（优先级从高到低）：
+//       ① 如果 stickyBacklog > 0 → Poll Sticky
+//          Server 说 Sticky 队列有积压，优先消化
+//       ② 如果 pendingStickyPoll <= pendingRegularPoll → Poll Sticky
+//          保持 Sticky 和 Regular 的 inflight 请求数大致 1:1
+//       ③ 否则 → Poll Normal
+//
+//       pendingStickyPollCount / pendingRegularPollCount 分别记录当前有多少个
+//       inflight 的 Poll 请求（getNextPollRequest 增，release() 减），用于让
+//       Mixed 模式维持两种队列的并发度平衡。
 func (wtp *workflowTaskPoller) getNextPollRequest() (request *workflowservice.PollWorkflowTaskQueueRequest) {
+	// 默认构造 Normal Queue 请求
 	taskQueue := &taskqueuepb.TaskQueue{
 		Name: wtp.taskQueueName,
 		Kind: enumspb.TASK_QUEUE_KIND_NORMAL,
 	}
 
 	if wtp.mode == NonSticky || wtp.stickyCacheSize <= 0 {
-		// Do nothing, taskQueue is already set to non-sticky
+		// 模式 A: 只用 Normal Queue，taskQueue 已设置完毕
 	} else if wtp.mode == Sticky {
+		// 模式 B: 只用 Sticky Queue
+		// Sticky Queue 名称 = 原始 taskQueueName + stickyUUID 后缀，
+		// NormalName 保留原始名称供 Server 做 fallback 匹配
 		taskQueue.Name = getWorkerTaskQueue(wtp.stickyUUID)
 		taskQueue.Kind = enumspb.TASK_QUEUE_KIND_STICKY
 		taskQueue.NormalName = wtp.taskQueueName
 	} else if wtp.mode == Mixed {
+		// 模式 C: 动态切换（默认）
 		wtp.requestLock.Lock()
+		// ① 优先消化 stickyBacklog
+		// ② 否则维持 Sticky/Normal 的 inflight 数均衡
 		if wtp.stickyBacklog > 0 || wtp.pendingStickyPollCount <= wtp.pendingRegularPollCount {
 			wtp.pendingStickyPollCount++
 			taskQueue.Name = getWorkerTaskQueue(wtp.stickyUUID)
@@ -1134,6 +1249,7 @@ func (wtp *workflowTaskPoller) getNextPollRequest() (request *workflowservice.Po
 		panic("unknown workflow task poller mode")
 	}
 
+	// 组装完整的 PollWorkflowTaskQueue 请求
 	builtRequest := &workflowservice.PollWorkflowTaskQueueRequest{
 		Namespace:      wtp.namespace,
 		TaskQueue:      taskQueue,
@@ -1151,7 +1267,6 @@ func (wtp *workflowTaskPoller) getNextPollRequest() (request *workflowservice.Po
 		WorkerInstanceKey: wtp.workerInstanceKey,
 	}
 	if wtp.getCapabilities().BuildIdBasedVersioning {
-		//lint:ignore SA1019 ignore deprecated versioning APIs
 		builtRequest.BinaryChecksum = ""
 	}
 	return builtRequest
@@ -1171,35 +1286,61 @@ func (wtp *workflowTaskPoller) pollWorkflowTaskQueue(ctx context.Context, reques
 }
 
 // Poll for a single workflow task from the service
+// poll 是 workflowTaskPoller 的具体 Poll 实现，被 basePoller.doPoll() 作为 pollFunc 参数调用。
+//
+// 它发一次 PollWorkflowTaskQueue gRPC 请求并处理响应。关键逻辑：
+//
+//   1. getNextPollRequest() — 决定这次 Poll Sticky Queue 还是 Normal Queue
+//      - Sticky (黏性): Server 优先把 Task 发给上次执行该 Workflow 的 Worker
+//        → Worker 本地已有缓存，无需重放全量 History，大幅降低延迟
+//      - Normal (普通): 首次执行或 Sticky 失效后的 fallback
+//      - Mixed 模式下根据 stickyBacklog + pendingPollCount 动态决策比例
+//
+//   2. pollWorkflowTaskQueue() — 🔴 gRPC 长轮询调用
+//
+//   3. 空响应处理 — Server 没有可分配的 Task 时返回空 TaskToken
+//      → 返回空的 &workflowTask{} (isEmpty()=true)，让 autoscaler 知道这次 Poll 是空的
+//
+//   4. 成功拿到 Task → 记录指标 → 转换为 workflowTask → 返回
 func (wtp *workflowTaskPoller) poll(ctx context.Context) (taskForWorker, error) {
 	traceLog(func() {
 		wtp.logger.Debug("workflowTaskPoller::Poll")
 	})
 
+	// ===== 步骤 1：决定 Poll 哪个队列（Sticky vs Normal）并构造请求 =====
 	request := wtp.getNextPollRequest()
+	// defer 释放 getNextPollRequest 中递增的 pendingPollCount 计数
 	defer wtp.release(request.TaskQueue.GetKind())
 
+	// ===== 步骤 2：🔥 gRPC 长轮询调用 =====
 	response, err := wtp.pollWorkflowTaskQueue(ctx, request)
 	if err != nil {
+		// Poll 失败 → 清空 backlog 估计（避免基于过期数据做决策）
 		wtp.updateBacklog(request.TaskQueue.GetKind(), 0)
 		return nil, err
 	}
 
+	// ===== 步骤 3：空响应 =====
+	// Server 没有此 Worker 能处理的 Task → 返回空 TaskToken
 	if response == nil || len(response.TaskToken) == 0 {
-		// Emit using base scope as no workflow type information is available in the case of empty poll
 		wtp.metricsHandler.Counter(metrics.WorkflowTaskQueuePollEmptyCounter).Inc(1)
 		wtp.updateBacklog(request.TaskQueue.GetKind(), 0)
+		// 返回空的 workflowTask：autoscaler 的 handleTask() 会因其 isEmpty()=true 而触发缩容
 		return &workflowTask{}, nil
 	}
 
+	// ===== 步骤 4：成功拿到 Task =====
+	// 记录 Poll 成功耗时（Sticky 和非 Sticky 分开统计）
 	if request.TaskQueue.GetKind() == enumspb.TASK_QUEUE_KIND_STICKY {
 		wtp.pollTimeTracker.recordPollSuccess(metrics.PollerTypeWorkflowStickyTask)
 	} else {
 		wtp.pollTimeTracker.recordPollSuccess(metrics.PollerTypeWorkflowTask)
 	}
 
+	// 更新 backlog 估计（Server 告知当前队列积压量，用于 Mixed 模式决策 Sticky/Normal 比例）
 	wtp.updateBacklog(request.TaskQueue.GetKind(), response.GetBacklogCountHint())
 
+	// 将 protobuf 响应转换为内部 workflowTask 结构体（含 History iterator 等）
 	task := wtp.toWorkflowTask(response)
 	traceLog(func() {
 		var firstEventID int64 = -1
@@ -1213,9 +1354,11 @@ func (wtp *workflowTaskPoller) poll(ctx context.Context) (taskForWorker, error) 
 			"IsQueryTask", response.Query != nil)
 	})
 
+	// 按 WorkflowType 打标签上报指标
 	metricsHandler := wtp.metricsHandler.WithTags(metrics.WorkflowTags(response.WorkflowType.GetName()))
 	metricsHandler.Counter(metrics.WorkflowTaskQueuePollSucceedCounter).Inc(1)
 
+	// 记录调度延迟：ScheduledTime → StartedTime（Server 内部等待+分发的耗时）
 	scheduleToStartLatency := response.GetStartedTime().AsTime().Sub(response.GetScheduledTime().AsTime())
 	metricsHandler.Timer(metrics.WorkflowTaskScheduleToStartLatency).Record(scheduleToStartLatency)
 	return task, nil
