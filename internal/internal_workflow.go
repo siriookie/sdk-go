@@ -311,7 +311,8 @@ var (
 )
 
 // Pointer to pointer to workflow result
-func getWorkflowResultPointerPointer(ctx Context) **workflowResult {
+func 
+(ctx Context) **workflowResult {
 	rpp := ctx.Value(workflowResultContextKey)
 	if rpp == nil {
 		panic("getWorkflowResultPointerPointer: Not a workflow context")
@@ -533,44 +534,88 @@ func newWorkflowContext(
 }
 
 func (d *syncWorkflowDefinition) Execute(env WorkflowEnvironment, header *commonpb.Header, input *commonpb.Payloads) {
+	// 创建 workflow 根 Context 和 workflowEnvironmentInterceptor。
+	// newWorkflowContext 会把 WorkflowEnvironment、workflow result 指针、namespace、task queue、
+	// workflow/run/task timeout、DataConverter、ContextPropagators、Activity 默认 task queue 等写进 Context。
+	// 它还会构造 envInterceptor，并按注册顺序反向包裹 WorkerInterceptor.InterceptWorkflow，
+	// 最后调用 inboundInterceptor.Init，让 interceptor 有机会替换 outboundInterceptor。
 	envInterceptor, rootCtx, err := newWorkflowContext(env, env.GetRegistry().interceptors)
 	if err != nil {
+		// Execute 接口没有 error 返回值；newWorkflowContext 初始化失败时只能 panic。
+		// 外层 ProcessEvent 有 recover，会把 panic 转成 workflow task 失败/工作流 panic 错误路径。
 		panic(err)
 	}
+	// 创建 workflow coroutine dispatcher，并创建名为 "root" 的根 coroutine。
+	// newDispatcher 内部会把 envInterceptor.outboundInterceptor 放进 dispatcher，
+	// 再调用 outboundInterceptor.Go(rootCtx, "root", rootFunc)，最终通过 dispatcher.NewCoroutine
+	// 创建根 coroutine，并返回带 coroutinesContextKey 的 rootCtx。
 	dispatcher, rootCtx := newDispatcher(
 		rootCtx,
 		envInterceptor,
 		func(ctx Context) {
+			// workflowResult 是 executeDispatcher 判断 workflow 是否已经返回的标记。
+			// 只要 workflowResult 指针仍然是 nil，executeDispatcher 就认为 workflow 还在运行或阻塞中。
 			r := &workflowResult{}
 
 			// We want to execute the user workflow definition from the first workflow task started,
 			// so they can see everything before that. Here we would have all initialization done, hence
 			// we are yielding.
+			// 这里主动 yield，保证 Execute 只是完成 runtime 初始化，不会立刻执行用户 workflow 函数。
+			// 真正推进这个 root coroutine 的地方是 OnWorkflowTaskStarted -> executeDispatcher。
+			// 因此 WorkflowExecutionStarted event 处理时会创建 coroutine，但用户 workflow 代码要等
+			// WorkflowTaskStarted event 触发 dispatcher 才开始跑。
 			state := getState(d.rootCtx)
 			state.yield("yield before executing to setup state")
+			// coroutine 被 dispatcher 再次调度回来后，标记当前 coroutine 已从 blocked/yield 状态恢复。
 			state.unblocked()
 
+			// 调用 d.workflow.Execute，也就是 getWorkflowDefinition 中创建的 workflowExecutor.Execute。
+			// workflowExecutor.Execute 会按普通/dynamic workflow 的规则解码 input，
+			// 经 inboundInterceptor.ExecuteWorkflow 调到用户 workflow 函数，
+			// 再把用户返回值编码成 Payloads，错误原样返回。
 			r.workflowResult, r.error = d.workflow.Execute(d.rootCtx, input)
+			// ctx 是 newDispatcher 创建 root coroutine 时传入的 coroutine context，
+			// 里面有 workflowResultContextKey，值是 **workflowResult。
+			// 把结果写进去后，下一次 executeDispatcher 会看到 rp != nil，
+			// 然后调用 env.Complete(result, err) 生成完成/失败/continue-as-new 等 workflow 结果。
 			rpp := getWorkflowResultPointerPointer(ctx)
 			*rpp = r
 		}, getWorkflowEnvironment(rootCtx).DrainUnhandledUpdates)
 
 	// set the information from the headers that is to be propagated in the workflow context
+	// 把 WorkflowExecutionStarted event 上的 header 通过 ContextPropagator 注入 workflow Context。
+	// workflowContextWithHeaderPropagated 会确保 header/header.Fields 非 nil，
+	// 逐个调用 ContextPropagator.ExtractToWorkflow，然后把 header.Fields 存进 Context。
 	rootCtx, err = workflowContextWithHeaderPropagated(rootCtx, header, env.GetContextPropagators())
 	if err != nil {
+		// header 传播失败同样无法从 Execute 返回 error，只能 panic，交给外层 workflow task 错误处理。
 		panic(err)
 	}
 
+	// 给 root workflow context 加 cancellation 能力。
+	// d.rootCtx 是后续 signal/update/query handler 和 workflowExecutor.Execute 使用的根 Context；
+	// d.cancel 会被 cancel handler 调用，用来取消 workflow.Context。
 	d.rootCtx, d.cancel = WithCancel(rootCtx)
+	// 保存 dispatcher，后续 OnWorkflowTaskStarted 会调用 executeDispatcher(d.rootCtx, d.dispatcher, ...)
+	// 来运行所有 ready coroutine，直到全部阻塞或 workflow 返回。
 	d.dispatcher = dispatcher
+	// envInterceptor.Go 需要 dispatcher.NewCoroutine；这里把 dispatcher 回填给 interceptor。
+	// newDispatcher 里也设置过一次，这里确保后续 handler 使用的是同一个 dispatcher。
 	envInterceptor.dispatcher = dispatcher
 
+	// 注册 workflow cancellation 的入口。
+	// ProcessEvent 处理 WorkflowExecutionCancelRequested 时会调用 workflowEnvironmentImpl.cancelHandler，
+	// 这里注册的 handler 会调用 d.cancel()，让 workflow.Context 进入 canceled 状态。
 	getWorkflowEnvironment(d.rootCtx).RegisterCancelHandler(func() {
 		// It is ok to call this method multiple times.
 		// it doesn't do anything new, the context remains canceled.
 		d.cancel()
 	})
 
+	// 注册 signal 的入口。
+	// ProcessEvent 处理 WorkflowExecutionSignaled event 时会调用 signalHandler(name,input,header)，
+	// 最终进入这里，把 signal header 先传播到 workflow Context，
+	// 再走 inboundInterceptor.HandleSignal。默认实现会把 payload 放进对应 signal channel。
 	getWorkflowEnvironment(d.rootCtx).RegisterSignalHandler(
 		func(name string, input *commonpb.Payloads, header *commonpb.Header) error {
 			// Put the header on context
@@ -582,14 +627,22 @@ func (d *syncWorkflowDefinition) Execute(env WorkflowEnvironment, header *common
 		},
 	)
 
+	// 注册 update 的入口。
+	// ProcessMessage 处理 Workflow Update protocol message 时会调用 updateHandler。
+	// defaultUpdateHandler 会传播 header、查找用户 SetUpdateHandler 注册的 handler、
+	// 解码 update 参数，并通过 updateSchedulerImpl{d.dispatcher} 创建/调度 update coroutine。
 	getWorkflowEnvironment(d.rootCtx).RegisterUpdateHandler(
 		func(name string, id string, serializedArgs *commonpb.Payloads, header *commonpb.Header, callbacks UpdateCallbacks) {
 			defaultUpdateHandler(d.rootCtx, name, id, serializedArgs, header, callbacks, updateSchedulerImpl{d.dispatcher})
 		})
 
+	// 注册 query 的入口。
+	// Query Task replay 完当前 history 后会调用 queryHandler(queryType,args,header)，
+	// 最终进入这里。Query 不生成 commands，只读取 replay 后的 workflow 内存状态并返回序列化结果。
 	getWorkflowEnvironment(d.rootCtx).RegisterQueryHandler(
 		func(queryType string, queryArgs *commonpb.Payloads, header *commonpb.Header) (*commonpb.Payloads, error) {
 			// Put the header on context if server supports it
+			// 每次 query 都使用 query 自己携带的 header 传播到 workflow Context。
 			rootCtx, err := workflowContextWithHeaderPropagated(d.rootCtx, header, env.GetContextPropagators())
 			if err != nil {
 				return nil, err
@@ -598,12 +651,17 @@ func (d *syncWorkflowDefinition) Execute(env WorkflowEnvironment, header *common
 			// As a special case, we handle __temporal_workflow_metadata query
 			// here instead of in workflowExecutionEventHandlerImpl.ProcessQuery
 			// because we need the context environment to do so.
+			// __temporal_workflow_metadata 是 SDK 内置 query。
+			// 它需要访问 workflow Context 里的 handler/metadata 信息，所以在这里直接处理。
 			if queryType == QueryTypeWorkflowMetadata {
 				if result, err := getWorkflowMetadata(rootCtx); err != nil {
 					return nil, err
 				} else {
 					// Use raw value built from default converter because we don't want to use
 					// user-conversion
+					// 先用默认 DataConverter 把 metadata 转成 payload，
+					// 再包装成 RawValue 交给 workflow 当前 DataConverter 编码；
+					// 注释说明这样做是为了避免 metadata 本身被用户 converter 改写。
 					resultPayload, err := converter.GetDefaultDataConverter().ToPayload(result)
 					if err != nil {
 						return nil, err
@@ -612,11 +670,17 @@ func (d *syncWorkflowDefinition) Execute(env WorkflowEnvironment, header *common
 				}
 			}
 
+			// 从 workflow Context 中取 workflowEnvOptions。
+			// 用户调用 workflow.SetQueryHandler 时，会把 query handler 注册到 eo.queryHandlers。
 			eo := getWorkflowEnvOptions(rootCtx)
 			// A handler must be present since it is needed for argument decoding,
 			// even if the interceptor intercepts query handling
+			// 即使 interceptor 最终要拦截 query，SDK 也必须先找到 handler，
+			// 因为参数解码需要 handler.fn 的函数签名和 handler.dataConverter。
 			handler, ok := eo.queryHandlers[queryType]
 			if !ok {
+				// 未注册 query handler 时，返回已知 query 类型列表。
+				// 这里包含三个内置 query，再追加用户注册的 queryHandlers key。
 				keys := []string{QueryTypeStackTrace, QueryTypeOpenSessions, QueryTypeWorkflowMetadata}
 				for k := range eo.queryHandlers {
 					keys = append(keys, k)
@@ -625,18 +689,23 @@ func (d *syncWorkflowDefinition) Execute(env WorkflowEnvironment, header *common
 			}
 
 			// Decode the arguments
+			// 根据用户 query handler 的函数签名，把 queryArgs payload 解码成 Go 参数。
 			args, err := decodeArgsToRawValues(handler.dataConverter, reflect.TypeOf(handler.fn), queryArgs)
 			if err != nil {
 				return nil, fmt.Errorf("unable to decode the input for queryType: %v, with error: %w", handler.queryType, err)
 			}
 
 			// Invoke
+			// 通过 inbound interceptor 调用 query。
+			// 默认 workflowEnvironmentInterceptor.HandleQuery 会找到 eo.queryHandlers[in.QueryType]，
+			// 然后执行 handler.execute(in.Args)。
 			result, err := envInterceptor.inboundInterceptor.HandleQuery(
 				rootCtx,
 				&HandleQueryInput{QueryType: queryType, Args: args},
 			)
 
 			// Encode the result
+			// query handler 成功后，用 handler.dataConverter 把返回值编码成 Payloads。
 			var serializedResult *commonpb.Payloads
 			if err == nil {
 				serializedResult, err = encodeArg(handler.dataConverter, result)
@@ -680,31 +749,59 @@ func newDispatcher(rootCtx Context, interceptor *workflowEnvironmentInterceptor,
 // executeDispatcher executed coroutines in the calling thread and calls workflow completion callbacks
 // if root workflow function returned
 func executeDispatcher(ctx Context, dispatcher dispatcher, timeout time.Duration) {
+	// 从 workflow Context 中取出 WorkflowEnvironment。
+	// 这里的 env 实际上通常是 workflowExecutionEventHandlerImpl / workflowEnvironmentImpl，
+	// env.Complete 会把 workflow 的最终 result/error 写回 SDK 内部状态，后续 CompleteWorkflowTask
+	// 会据此生成 CompleteWorkflowExecution / FailWorkflowExecution / ContinueAsNew 等 command。
 	env := getWorkflowEnvironment(ctx)
+	// 让 dispatcher 运行所有 ready 的 workflow coroutines。
+	// ExecuteUntilAllBlocked 会按确定性顺序逐个唤醒 coroutine，
+	// 一直跑到所有 coroutine 都阻塞、全部结束、或检测到 panic/deadlock。
+	// 这里不会直接调用 server；它只推进本地 workflow runtime。
 	panicErr := dispatcher.ExecuteUntilAllBlocked(timeout)
 	if panicErr != nil {
+		// 如果某个 coroutine panic 或 deadlock detector 产生 workflowPanicError，
+		// dispatcher 会把错误返回到这里。
+		// env.Complete(nil, panicErr) 表示 workflow 以这个错误完成到 SDK 内部状态，
+		// 后续 workflow task completion 逻辑会按 panic policy 生成失败或 WFT failed。
 		env.Complete(nil, panicErr)
 		return
 	}
 
+	// root workflow coroutine 返回时，会在 syncWorkflowDefinition.Execute 创建的 root func 里
+	// 把 *workflowResult 写进 workflowResultContextKey 保存的 **workflowResult。
+	// 这里解引用后如果仍然是 nil，说明用户 workflow 函数还没 return，
+	// 只是当前能跑的 coroutine 都阻塞了，例如阻塞在 Activity Future.Get、workflow.Sleep、signal Receive 等。
 	rp := *getWorkflowResultPointerPointer(ctx)
 	if rp == nil {
 		// Result is not set, so workflow is still executing
+		// workflow 还没结束，本次 WFT 可能会带出 commands，也可能只是等待 local activity/update 等。
+		// 这里直接返回，不调用 env.Complete。
 		return
 	}
 
+	// 走到这里说明 root workflow 函数已经 return 了，rp 里有 workflowResult 和 error。
+	// 在真正 Complete 之前，SDK 做一些收尾检查和日志提示。
 	weo := getWorkflowEnvOptions(ctx)
+	// 检查 signal channel 里是否还有未消费的 signal。
+	// getUnhandledSignalNames 会尝试从每个 signal channel 取一个值；
+	// 如果取到了，会把值放回 ch.recValue，避免检查动作真的消费掉 signal。
 	us := weo.getUnhandledSignalNames()
 	if len(us) > 0 {
+		// workflow 已经 return，但还有 signal 没被用户代码接收，记录 warning。
 		env.GetLogger().Warn("Workflow has unhandled signals", "SignalNames", us)
 	}
 	// Warn if there are any update handlers still running
+	// warnUpdate 是日志里输出的 update 信息，只保留 name 和 id。
 	type warnUpdate struct {
 		Name string `json:"name"`
 		ID   string `json:"id"`
 	}
+	// 收集 workflow return 时仍在运行、且 unfinished policy 是 WarnAndAbandon 的 update handler。
 	var updatesToWarn []warnUpdate
 	for _, info := range weo.getRunningUpdateHandles() {
+		// runningUpdatesHandles 只记录还没结束的 update；
+		// updateHandlers[info.Name].unfinishedPolicy 决定 workflow 结束时遇到未完成 update 如何处理。
 		if weo.updateHandlers[info.Name].unfinishedPolicy == HandlerUnfinishedPolicyWarnAndAbandon {
 			updatesToWarn = append(updatesToWarn, warnUpdate{
 				Name: info.Name,
@@ -714,12 +811,17 @@ func executeDispatcher(ctx Context, dispatcher dispatcher, timeout time.Duration
 	}
 
 	// Verify that the workflow did not fail. If it did we will not warn about unhandled updates.
+	// workflow 如果是正常完成、CanceledError、ContinueAsNewError，则对未完成 update 记 warning。
+	// 如果 workflow 自己失败了，则不再额外提示未完成 update，避免用次要 warning 干扰真正失败原因。
 	var canceledErr *CanceledError
 	var contErr *ContinueAsNewError
 	if len(updatesToWarn) > 0 && (rp.error == nil || errors.As(rp.error, &canceledErr) || errors.As(rp.error, &contErr)) {
 		env.GetLogger().Warn(unhandledUpdateWarningMessage, "Updates", updatesToWarn)
 	}
 
+	// 把 root workflow 函数的返回值/错误交给 WorkflowEnvironment。
+	// 这一步只更新 SDK 内部完成状态；真正发给 server 要等外层 ProcessWorkflowTask
+	// 调 CompleteWorkflowTask/RespondWorkflowTaskCompleted。
 	env.Complete(rp.workflowResult, rp.error)
 }
 
@@ -1262,62 +1364,108 @@ func (d *dispatcherImpl) IsClosed() bool {
 }
 
 func (d *dispatcherImpl) ExecuteUntilAllBlocked(deadlockDetectionTimeout time.Duration) (err error) {
+	// dispatcher 的执行状态由 mutex 保护。
+	// 这里先检查 dispatcher 是否已经关闭；关闭后不能再调度 coroutine。
 	d.mutex.Lock()
 	if d.closed {
 		d.mutex.Unlock()
 		panic("dispatcher is closed")
 	}
+	// 防止重入。
+	// ExecuteUntilAllBlocked 只能由外层 workflow task 处理线程调用；
+	// 如果 workflow coroutine 自己又递归触发 dispatcher 执行，会破坏确定性调度顺序。
 	if d.executing {
 		d.mutex.Unlock()
 		panic("call to ExecuteUntilAllBlocked (possibly from a coroutine) while it is already running")
 	}
+	// 标记 dispatcher 正在执行。
+	// getState(ctx) 会检查 dispatcher.IsExecuting()，确保阻塞类 workflow API 只能在 dispatcher 正在调度时使用。
 	d.executing = true
 	d.mutex.Unlock()
+	// 无论本函数正常返回还是因为 panic unwind，最终都要清除 executing 标记。
 	defer func() {
 		d.mutex.Lock()
 		d.executing = false
 		d.mutex.Unlock()
 	}()
+	// allBlocked 表示当前一轮扫描后，所有 coroutine 都没有取得新进展，只是继续阻塞。
+	// 初始设为 false，是为了至少进入一次循环，让 coroutine 有机会从 initialYield 中被唤醒。
 	allBlocked := false
 	// Keep executing until at least one goroutine made some progress
+	// 循环条件含义：
+	// - !allBlocked：上一轮至少有 coroutine 前进/结束/创建新 coroutine，因此还要继续扫描；
+	// - d.allBlockedCallback()：即使所有 coroutine 都阻塞，也给环境一次机会处理积压工作。
+	//   对 workflow 来说，这个 callback 是 DrainUnhandledUpdates，可能把没有 handler 的 buffered update
+	//   调度出来并拒绝；如果它返回 true，说明状态被更新了，需要再跑一轮。
 	for !allBlocked || d.allBlockedCallback() {
+		// highPriority/eager coroutine 会先放到 newEagerCoroutines。
+		// 每轮开始时把它们插到普通 coroutine 队列最前面，保证例如 Update handler 这类高优先级任务先跑。
 		d.coroutines = append(d.newEagerCoroutines, d.coroutines...)
 		d.newEagerCoroutines = nil
 		// Give every coroutine chance to execute removing closed ones
+		// 乐观假设本轮所有 coroutine 都会保持阻塞；
+		// 后面只要发现某个 coroutine 结束、前进、或创建新 coroutine，就把 allBlocked 改回 false。
 		allBlocked = true
+		// 记录本轮开始前的 coroutine sequence。
+		// NewCoroutine 会递增 d.sequence；循环末尾用它判断本轮是否创建了新 coroutine。
 		lastSequence := d.sequence
+		// 按 d.coroutines 顺序给每个 coroutine 一次执行机会。
+		// 这个顺序就是 SDK workflow coroutine 的确定性调度顺序。
 		for i := 0; i < len(d.coroutines); i++ {
 			c := d.coroutines[i]
 			if !c.closed.Load() {
 				// TODO: Support handling of panic in a coroutine by dispatcher.
 				// TODO: Dump all outstanding coroutines if one of them panics
+				// c.call 会向 coroutine 的 unblock channel 发送一个 unblock 函数，
+				// 让 coroutine 从 yield/initialYield 处继续执行；
+				// 然后 c.call 等待 coroutine 再次 aboutToBlock、结束，或 deadlock timeout。
 				c.call(deadlockDetectionTimeout)
 			}
 			// c.call() can close the context so check again
 			if c.closed.Load() {
 				// remove the closed one from the slice
+				// coroutine 已结束，从 dispatcher 队列里移除。
+				// i-- 是为了让下一轮 for 继续检查移动到当前位置的元素。
 				d.coroutines = append(d.coroutines[:i],
 					d.coroutines[i+1:]...)
 				i--
 				if c.panicError != nil {
+					// coroutine.run 捕获到 panic，或 c.call 检测到 deadlock 后，
+					// 会把错误放到 c.panicError。
+					// 这里直接返回给 executeDispatcher，由它调用 env.Complete(nil, panicErr)。
 					return c.panicError
 				}
+				// 有 coroutine 结束，说明本轮状态发生变化；
+				// 不能认为所有 coroutine 都保持阻塞，需要继续外层循环。
 				allBlocked = false
 
 			} else {
+				// coroutine 没结束时，用 keptBlocked 判断它是否只是“被唤醒后仍然阻塞”。
+				// yield 会设置 keptBlocked=true；如果 coroutine 取得进展，会调用 unblocked() 把它设为 false。
+				// 因此只要有一个未关闭 coroutine 的 keptBlocked=false，allBlocked 就会变成 false。
 				allBlocked = allBlocked && (c.keptBlocked || c.closed.Load())
 			}
 			// If any eager coroutines were created by the last coroutine we
 			// need to schedule them now.
+			// 当前 coroutine 执行期间可能创建 highPriority coroutine，例如 Update handler。
+			// 这些 eager coroutine 要插到当前 i 后面，尽快在本轮继续执行，而不是等下一轮。
 			if len(d.newEagerCoroutines) > 0 {
 				d.coroutines = slices.Insert(d.coroutines, i+1, d.newEagerCoroutines...)
 				d.newEagerCoroutines = nil
+				// 创建了新的 coroutine，说明本轮状态有新工作，外层循环不能结束。
 				allBlocked = false
 			}
 		}
 		// Set allBlocked to false if new coroutines where created
+		// 如果本轮开始后 d.sequence 变化，说明创建了普通或 eager coroutine。
+		// 即使上面的判断没有捕捉到，也要把 allBlocked 置为 false，保证新 coroutine 有机会运行。
 		allBlocked = allBlocked && lastSequence == d.sequence
 	}
+	// 走到这里表示：
+	// - 所有 coroutine 都阻塞或已经结束；
+	// - allBlockedCallback 也没有产生新工作；
+	// - 没有 panic/deadlock。
+	// 对外层 executeDispatcher 来说，这意味着本次本地 workflow runtime 推进完成。
 	return nil
 }
 

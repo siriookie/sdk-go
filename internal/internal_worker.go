@@ -941,25 +941,58 @@ func (r *registry) getRegisteredActivityTypes() []string {
 }
 
 func (r *registry) getWorkflowDefinition(wt WorkflowType) (WorkflowDefinition, error) {
+	// 上游 handleWorkflowExecutionStarted 会把 workflowInfo.WorkflowType 传进来；
+	// workflowInfo.WorkflowType 来自当前 WorkflowExecutionStarted history event 的 workflow type。
+	// 这里先用这个名字作为 registry 查找 key。
 	lookup := wt.Name
+	// RegisterWorkflowWithOptions 在 options.Name 非空且 alias map 启用时，
+	// 会执行 workflowAliasMap[fnName] = options.Name，同时把 workflowFuncMap[options.Name] = wf。
+	// 因此如果这里传入的是 Go 函数名 fnName，getWorkflowAlias 会把它转换成真正注册在 workflowFuncMap 里的 options.Name。
+	// 如果 alias map 被 DisableRegistrationAliasing 关闭，workflowAliasMap 为 nil，这一步自然查不到 alias。
 	if alias, ok := r.getWorkflowAlias(lookup); ok {
 		lookup = alias
 	}
+	// getWorkflowFn 的实现顺序是：
+	// 1. 先查 workflowFuncMap[lookup]，也就是 RegisterWorkflowWithOptions 写入的普通 workflow 或 factory；
+	// 2. 如果普通表没命中，但 dynamicWorkflow 非空，返回字符串 "dynamic" 和 ok=true；
+	// 3. 两者都没有才返回 nil,false。
 	wf, ok := r.getWorkflowFn(lookup)
 	if !ok {
+		// 到这里说明 workflowFuncMap 没有 lookup，且没有注册 dynamic workflow。
+		// supported 只列出 workflowFuncMap 中的固定 workflow type；dynamic workflow 不在这个列表里。
+		// 这个错误会返回给 handleWorkflowExecutionStarted，再让当前 Workflow Task 按 SDK 错误路径失败。
 		supported := strings.Join(r.getRegisteredWorkflowTypes(), ", ")
 		return nil, fmt.Errorf("unable to find workflow type: %v. Supported types: [%v]", lookup, supported)
 	}
+	// RegisterWorkflowWithOptions 支持直接传入 WorkflowDefinitionFactory。
+	// 这种 factory 会以 options.Name 作为 key 存进 workflowFuncMap。
+	// WorkflowDefinitionFactory 接口注释要求 NewWorkflowDefinition 每次都返回新的 WorkflowDefinition；
+	// 所以这里不再包装 workflowExecutor，而是直接让 factory 创建本次 workflow execution 的 definition。
 	wdf, ok := wf.(WorkflowDefinitionFactory)
 	if ok {
 		return wdf.NewWorkflowDefinition(), nil
 	}
+	// dynamic 用来告诉 workflowExecutor.Execute 采用 dynamic workflow 的参数解码方式。
+	// validateFnFormat(..., isWorkflow=true, isDynamic=true) 要求 dynamic workflow 形如：
+	// func(workflow.Context, converter.EncodedValues) (..., error)
+	// 所以 executor.Execute 在 dynamic=true 时不会按普通函数签名逐个解码参数，
+	// 而是把整个 input 包成一个 EncodedValues 作为唯一业务参数传进去。
 	var dynamic bool
+	// getWorkflowFn 在 fallback 到 dynamic workflow 时返回字符串 "dynamic" 作为哨兵值，
+	// 这里识别哨兵值后，替换成 RegisterDynamicWorkflow 保存到 r.dynamicWorkflow 的真实函数或 factory。
 	if d, ok := wf.(string); ok && d == "dynamic" {
 		wf = r.dynamicWorkflow
 		dynamic = true
 	}
+	// workflowExecutor.Execute 是后续真正调用用户 workflow 函数的那层：
+	// 普通 workflow 会用 decodeArgsToRawValues 按函数签名解码 input；
+	// dynamic workflow 会把 input 包成 EncodedValues；
+	// 然后通过 inboundInterceptor.ExecuteWorkflow 调用用户函数，并把返回值 encode 成 payload。
 	executor := &workflowExecutor{workflowType: lookup, fn: wf, interceptors: r.interceptors, dynamic: dynamic}
+	// newSyncWorkflowDefinition 只是把 workflowExecutor 包成 WorkflowDefinition。
+	// handleWorkflowExecutionStarted 随后会调用 definition.Execute；
+	// syncWorkflowDefinition.Execute 会创建 dispatcher/root coroutine，并在 root coroutine 里先 yield。
+	// 真正驱动 dispatcher 运行用户 workflow 代码的是后续 WorkflowTaskStarted 事件触发的 OnWorkflowTaskStarted。
 	return newSyncWorkflowDefinition(executor), nil
 }
 
@@ -1221,27 +1254,27 @@ type AggregatedWorker struct {
 	registry       *registry       // Worker 级别的注册表：存储 Workflow/Activity/NexusService 的映射
 
 	// started 在 start() 执行开始时即设置为 true，代表 Worker 已经启动（或正在启动中）
-	started      atomic.Bool
+	started atomic.Bool
 	// shuttingDown 在 Stop() 被调用时设置为 true，用于通知心跳回调等组件当前正在关闭
 	shuttingDown atomic.Bool
 	// stopC 是一个关闭后永不重置的 channel（close-once），所有子 Worker 的 goroutine
 	// 通过 <-stopC 来感知"Worker 需要停止"的信号，实现统一的优雅关闭
 	stopC        chan struct{}
-	fatalErr     error        // 致命错误（来自 WorkerFatalErrorCallback 回调）
-	fatalErrLock sync.Mutex   // 保护 fatalErr 的读写互斥锁
+	fatalErr     error      // 致命错误（来自 WorkerFatalErrorCallback 回调）
+	fatalErrLock sync.Mutex // 保护 fatalErr 的读写互斥锁
 
 	// capabilities 保存了 Temporal Server 的能力信息（如是否支持某些 protobuf 特性）。
 	// 这是一个指针，因为 Worker 在创建时还没有连接 Server，只有在 Start() 中
 	// 通过 loadCapabilities() 从 Server 获取后才填充，各子 Worker 通过解引用读取。
 	capabilities *workflowservice.GetSystemInfoResponse_Capabilities
 
-	workerInstanceKey     string                                    // Worker 实例的唯一标识符（UUID），用于心跳识别
-	plugins               []WorkerPlugin                            // Worker 插件列表（含 Client 级别 + WorkerOptions 级别）
+	workerInstanceKey     string                                      // Worker 实例的唯一标识符（UUID），用于心跳识别
+	plugins               []WorkerPlugin                              // Worker 插件列表（含 Client 级别 + WorkerOptions 级别）
 	pluginRegistryOptions *WorkerPluginConfigureWorkerRegistryOptions // 插件在 ConfigureWorker 阶段填充的注册选项（Never nil）
 
-	heartbeatMetrics             *heartbeatMetricsHandler           // 心跳指标采集器（仅当 workerHeartbeatInterval != 0 时创建）
-	heartbeatCallback            func() *workerpb.WorkerHeartbeat   // 构造心跳 PB 消息的回调函数（在心跳 goroutine 中并发调用）
-	workerPollCompleteOnShutdown *atomic.Bool                       // Server 是否支持"Shutdown 时完成当前 Poll"的标志
+	heartbeatMetrics             *heartbeatMetricsHandler         // 心跳指标采集器（仅当 workerHeartbeatInterval != 0 时创建）
+	heartbeatCallback            func() *workerpb.WorkerHeartbeat // 构造心跳 PB 消息的回调函数（在心跳 goroutine 中并发调用）
+	workerPollCompleteOnShutdown *atomic.Bool                     // Server 是否支持"Shutdown 时完成当前 Poll"的标志
 }
 
 // RegisterWorkflow registers workflow implementation with the AggregatedWorker
@@ -1338,11 +1371,11 @@ func (aw *AggregatedWorker) Start() error {
 // start 是 Worker 真正的启动逻辑，被 memoizedStart 包裹以确保只执行一次。
 //
 // 启动流程（按顺序）：
-//   1. 初始化二进制校验和 + 确保 Client 连接到 Server
-//   2. 从 Server 拉取 Capabilities 和 Namespace 数据（payload 限制等）
-//   3. 按顺序启动各子 Worker：workflowWorker → activityWorker → sessionWorker → nexusWorker
-//      - 如果某个子 Worker 启动失败，会回滚已启动的子 Worker（保证优雅清理）
-//   4. 注册心跳 Worker（如果启用了心跳）
+//  1. 初始化二进制校验和 + 确保 Client 连接到 Server
+//  2. 从 Server 拉取 Capabilities 和 Namespace 数据（payload 限制等）
+//  3. 按顺序启动各子 Worker：workflowWorker → activityWorker → sessionWorker → nexusWorker
+//     - 如果某个子 Worker 启动失败，会回滚已启动的子 Worker（保证优雅清理）
+//  4. 注册心跳 Worker（如果启用了心跳）
 //
 // 注意：此方法通过 sync.OnceValue 被 memoized，所以是幂等的。
 func (aw *AggregatedWorker) start() error {
@@ -2223,10 +2256,10 @@ func extractHistoryFromFile(jsonfileName string, lastEventID int64) (hist *histo
 // NewAggregatedWorker 创建一个聚合 Worker 实例，它是 Temporal Go SDK 中 Worker 的核心入口。
 //
 // 生命周期概览：
-//   1. NewAggregatedWorker(): 构造 + 校验参数 + 创建各子 Worker + 设置心跳回调 + 包装 memoizedStart
-//   2. RegisterWorkflow/RegisterActivity/...: 注册 Workflow/Activity/Nexus Service
-//   3. Start() -> memoizedStart() -> start(): 连接 Server、获取 capabilities、启动各子 Worker、启动心跳
-//   4. Stop(): 逐个关闭子 Worker、deregister 心跳、等待完成
+//  1. NewAggregatedWorker(): 构造 + 校验参数 + 创建各子 Worker + 设置心跳回调 + 包装 memoizedStart
+//  2. RegisterWorkflow/RegisterActivity/...: 注册 Workflow/Activity/Nexus Service
+//  3. Start() -> memoizedStart() -> start(): 连接 Server、获取 capabilities、启动各子 Worker、启动心跳
+//  4. Stop(): 逐个关闭子 Worker、deregister 心跳、等待完成
 //
 // 参数：
 //   - client: SDK 客户端，包含 gRPC 连接、DataConverter、interceptors 等基础能力
@@ -2443,11 +2476,11 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 			taskQueue:     taskQueue,
 			maxConcurrent: options.MaxConcurrentEagerActivityExecutionSize,
 		}),
-		capabilities:                 &capabilities,           // 延迟填充：start() 中从 Server 拉取
-		pollTimeTracker:              &pollTimeTracker{},      // 追踪各 Poll 的耗时和空闲时间
+		capabilities:                 &capabilities,      // 延迟填充：start() 中从 Server 拉取
+		pollTimeTracker:              &pollTimeTracker{}, // 追踪各 Poll 的耗时和空闲时间
 		workerInstanceKey:            workerInstanceKey,
 		workerPollCompleteOnShutdown: workerPollCompleteOnShutdown,
-		serverSupportsAutoscaling:    &atomic.Bool{},          // 延迟填充：start() 中根据 Server 能力设置
+		serverSupportsAutoscaling:    &atomic.Bool{}, // 延迟填充：start() 中根据 Server 能力设置
 		// inboundPayloadVisitor：处理进入 Worker 的 Payload（如外部存储引用解析）
 		inboundPayloadVisitor: extstore.NewExternalRetrievalVisitor(client.storageParams),
 		// outboundPayloadVisitor：处理离开 Worker 的 Payload（如外部存储上传 + Payload 大小限制检查）
@@ -2715,10 +2748,10 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 	// =========================================================================
 	// 将前面创建的所有组件和子 Worker 聚合在一起，形成完整的 AggregatedWorker。
 	aw = &AggregatedWorker{
-		client:                       client,
-		workflowWorker:               workflowWorker,
-		activityWorker:               activityWorker,
-		sessionWorker:                sessionWorker,
+		client:         client,
+		workflowWorker: workflowWorker,
+		activityWorker: activityWorker,
+		sessionWorker:  sessionWorker,
 		// nexusWorker 不在这里创建：它的创建时机在 start() 中（详见阶段 13 注释）。
 		logger:                       workerParams.Logger,
 		registry:                     registry,
